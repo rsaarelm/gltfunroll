@@ -109,22 +109,29 @@ impl Context {
 // Don't bother with scenes, just have one root node.
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct Branch((Node,), BTreeMap<String, Branch>);
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 struct Node {
-    pub children: BTreeMap<String, Node>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub mesh: Vec<Primitive>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub skin: Option<Skin>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transform: Option<Trs>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transform_matrix: Option<Mat4>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub camera: Option<Camera>,
     // Animation implicitly attached to one node.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub animations: BTreeMap<String, Vec<Channel>>,
 }
 
 impl Node {
-    pub fn new(ctx: &Context, source: &gltf::Node) -> Result<Self> {
-        // TODO: Support node transforms. (Raylib doesn't like them so they're
-        // not high priority.)
-
-        // TODO: Support node cameras. Again, not high priority for model
+    pub fn new(ctx: &Context, source: &gltf::Node) -> Result<Branch> {
+        // TODO: Support node cameras. Not high priority for model
         // work.
         let mut children = BTreeMap::new();
         for child in source.children() {
@@ -132,9 +139,29 @@ impl Node {
             children.insert(name, Self::new(ctx, &child)?);
         }
 
-        let skin = source.skin().map(|s| Skin::new(&s)).transpose()?;
+        let skin = source.skin().map(|s| Skin::new(ctx, &s)).transpose()?;
 
-        // XXX: Ignoring mesh weights. Do we need them?
+        // Flatten matrix/TRS transform into Node attribute level.
+        let mut transform = None;
+        let mut transform_matrix = None;
+        match source.transform() {
+            gltf::scene::Transform::Matrix { matrix } => {
+                transform_matrix = Some(Mat4::from_cols_array_2d(&matrix));
+            }
+            gltf::scene::Transform::Decomposed {
+                translation,
+                rotation,
+                scale,
+            } => {
+                transform = Some(Trs {
+                    translation: Vec3::from(translation),
+                    rotation: Quat::from_array(rotation),
+                    scale: Vec3::from(scale),
+                });
+            }
+        }
+
+        // XXX: We're ignoring morph targets and morph target weights for now.
 
         let mesh = source
             .mesh()
@@ -169,13 +196,14 @@ impl Node {
             animations.insert(name, channels);
         }
 
-        Ok(Node {
-            children,
+        Ok(Branch((Node {
             mesh,
             skin,
+            transform,
+            transform_matrix,
             animations,
             ..Default::default()
-        })
+        },), children))
     }
 }
 
@@ -196,38 +224,58 @@ enum Camera {
     },
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct Trs {
+    translation: Vec3,
+    rotation: Quat,
+    scale: Vec3,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 struct Skin {
-    pub joints: Vec<usize>,
-    pub inverse_bind_matrices: Vec<Mat4>,
+    pub joints: Vec<String>,
+    pub inverse_bind_matrices: Vec<[[f32; 4]; 4]>,
 }
 
 impl Skin {
-    pub fn new(_source: &gltf::Skin) -> Result<Self> {
-        // TODO: Parse skin data, needs buffer access
-        Ok(Default::default())
-        /*
-        let joints = source.joints().map(|n| n.index()).collect();
-        // How do get matrix data?
+    pub fn new(ctx: &Context, source: &gltf::Skin) -> Result<Self> {
+        let joints: Vec<String> = source
+            .joints()
+            .map(|n| {
+                n.name()
+                    .map(|n| n.to_string())
+                    .ok_or_else(|| anyhow::anyhow!("Skin: Joint has no name"))
+            })
+            .collect::<Result<Vec<String>>>()?;
+
+        let inverse_bind_matrices = source
+            .reader(|buffer| ctx.buffers.get(buffer.index()).map(|b| b.0.as_slice()))
+            .read_inverse_bind_matrices()
+            .expect("Skin: No inverse bind matrices")
+            .collect();
+
         Ok(Self {
             joints,
             inverse_bind_matrices,
         })
-        */
     }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
 struct Primitive {
-    pub indices: Vec<u32>,
-    pub material: Material,
+    // Make these into chunks just so the IDM document does not end up with a
+    // giant line.
+    pub indices: Vec<Vec<u32>>,
 
     pub positions: Vec<Vec3>,
     pub normals: Vec<Vec3>,
     pub tex_coords: Vec<Vec2>,
     pub joints: Vec<[u16; 4]>,
     pub weights: Vec<Vec4>,
+
+    pub material: Material,
 }
 
 impl Primitive {
@@ -240,6 +288,7 @@ impl Primitive {
             .expect("Primitive: No indices")
             .into_u32()
             .collect::<Vec<_>>();
+        let indices = indices.chunks(3).map(|c| c.to_vec()).collect();
 
         let mut positions = Vec::new();
         let mut normals = Vec::new();
@@ -281,6 +330,7 @@ impl Primitive {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
 struct Material {
     pub texture_map: Option<String>,
     pub metallic_factor: f32,
