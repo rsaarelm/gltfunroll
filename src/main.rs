@@ -7,7 +7,6 @@ use anyhow::{bail, Result};
 use clap::Parser;
 use glam::{Mat4, Quat, Vec2, Vec3, Vec4};
 use gltf::animation::util::ReadOutputs;
-use is_terminal::IsTerminal;
 use serde::{Deserialize, Serialize};
 
 /// An opinionated tool that unwraps glTF models to a more readable and
@@ -33,24 +32,10 @@ fn main() -> Result<()> {
 fn unroll(file: impl AsRef<Path>) -> Result<()> {
     let file = file.as_ref();
 
-    // Output an IDM file next to the glTF. If one already exists, ask if it's
-    // okay to overwrite it. Except if we're not in an interactive session, in
-    // which case overwriter goes brrr.
     let idm_file = file.with_extension("idm");
-    if std::io::stdout().is_terminal() && idm_file.exists() {
-        let ok = dialoguer::Confirm::new()
-            .with_prompt(format!(
-                "Overwrite existing {}?",
-                idm_file.to_string_lossy()
-            ))
-            .interact()?;
 
-        // If the user says no, bail.
-        if !ok {
-            eprintln!("Aborted.");
-            return Ok(());
-        }
-    }
+    // Do smart backups so we don't lose data.
+    backup(&idm_file)?;
 
     // Initial glTF loading.
 
@@ -72,8 +57,12 @@ fn roll(file: impl AsRef<Path>) -> Result<()> {
     let _node: Node = idm::from_str(&std::fs::read_to_string(file)?)?;
 
     // Change extension to .gltf and .bin.
-    let _gltf_file = file.with_extension("gltf");
-    let _bin_file = file.with_extension("bin");
+    let gltf_file = file.with_extension("gltf");
+    let bin_file = file.with_extension("bin");
+
+    // Do smart backups so we don't lose data.
+    backup(&gltf_file)?;
+    backup(&bin_file)?;
 
     todo!("Roll IDM back to glTF");
 }
@@ -196,14 +185,17 @@ impl Node {
             animations.insert(name, channels);
         }
 
-        Ok(Branch((Node {
-            mesh,
-            skin,
-            transform,
-            transform_matrix,
-            animations,
-            ..Default::default()
-        },), children))
+        Ok(Branch(
+            (Node {
+                mesh,
+                skin,
+                transform,
+                transform_matrix,
+                animations,
+                ..Default::default()
+            },),
+            children,
+        ))
     }
 }
 
@@ -432,4 +424,49 @@ fn gensym() -> String {
         COUNTER += 1;
         format!("gensym#{counter}")
     }
+}
+
+/// Smart backup that makes consecutive backups of a file, but reuses the last
+/// backup as long as the file does not change.
+fn backup(file: impl AsRef<Path>) -> Result<()> {
+    let file = file.as_ref();
+
+    if !file.exists() {
+        // No need to backup what ins't there.
+        return Ok(());
+    }
+
+    // Find the highest backup number.
+    let mut highest = 1;
+    for entry in std::fs::read_dir(file.parent().unwrap())? {
+        let entry = entry?;
+        let path = entry.path();
+        let Some(ext) = path.extension() else {
+            continue;
+        };
+        if path.file_stem() != Some(file.as_os_str()) {
+            continue;
+        }
+
+        let Ok(n) = ext.to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        if n > highest {
+            highest = n;
+        }
+    }
+
+    let last_backup = PathBuf::from(format!("{}.{}", file.to_string_lossy(), highest));
+
+    if last_backup.exists() && std::fs::read(file)? == std::fs::read(&last_backup)? {
+        eprintln!(
+            "{} is already backed up in {}",
+            file.to_string_lossy(),
+            last_backup.to_string_lossy()
+        );
+        return Ok(());
+    }
+
+    std::fs::copy(file, &last_backup)?;
+    Ok(())
 }
