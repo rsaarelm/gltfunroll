@@ -5,7 +5,8 @@ use std::{
 
 use anyhow::{bail, Result};
 use clap::Parser;
-use glam::{Mat4, Vec2, Vec3, Vec4};
+use glam::{Mat4, Quat, Vec2, Vec3, Vec4};
+use gltf::animation::util::ReadOutputs;
 use is_terminal::IsTerminal;
 use serde::{Deserialize, Serialize};
 
@@ -53,25 +54,12 @@ fn unroll(file: impl AsRef<Path>) -> Result<()> {
 
     // Initial glTF loading.
 
-    let (gltf, _buffers, _images) = gltf::import(file)?;
+    let ctx = Context::new(file)?;
 
-    // Find the unique root node in gltf.
-    let children: HashSet<usize> = gltf
-        .nodes()
-        .flat_map(|n| n.children().map(|n| n.index()))
-        .collect();
-    let mut root_nodes = gltf.nodes().filter(|n| !children.contains(&n.index()));
-    let Some(root_node) = root_nodes.next() else {
-        bail!("No root node found")
-    };
-    if root_nodes.next().is_some() {
-        bail!("Multiple root nodes found");
-    }
-
-    let node = Node::new(&gltf, &root_node)?;
+    let root = Node::new(&ctx, &ctx.root_node()?)?;
 
     // Serialize to IDM.
-    std::fs::write(idm_file, idm::to_string(&node)?)?;
+    std::fs::write(idm_file, idm::to_string(&root)?)?;
 
     Ok(())
 }
@@ -90,21 +78,49 @@ fn roll(file: impl AsRef<Path>) -> Result<()> {
     todo!("Roll IDM back to glTF");
 }
 
+struct Context {
+    pub gltf: gltf::Document,
+    pub buffers: Vec<gltf::buffer::Data>,
+}
+
+impl Context {
+    pub fn new(path: impl AsRef<Path>) -> Result<Context> {
+        let (gltf, buffers, _images) = gltf::import(path)?;
+        Ok(Context { gltf, buffers })
+    }
+
+    pub fn root_node(&self) -> Result<gltf::Node> {
+        let children: HashSet<usize> = self
+            .gltf
+            .nodes()
+            .flat_map(|n| n.children().map(|n| n.index()))
+            .collect();
+        let mut root_nodes = self.gltf.nodes().filter(|n| !children.contains(&n.index()));
+        let Some(root_node) = root_nodes.next() else {
+            bail!("No root node found")
+        };
+        if root_nodes.next().is_some() {
+            bail!("Multiple root nodes found");
+        }
+        Ok(root_node)
+    }
+}
+
 // Don't bother with scenes, just have one root node.
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 struct Node {
-    children: BTreeMap<String, Node>,
-    mesh: Vec<Primitive>,
-    skin: Option<Skin>,
-    camera: Option<Camera>,
+    pub children: BTreeMap<String, Node>,
+    pub mesh: Vec<Primitive>,
+    pub skin: Option<Skin>,
+    pub camera: Option<Camera>,
     // Animation implicitly attached to one node.
-    animations: BTreeMap<String, Vec<Channel>>,
+    pub animations: BTreeMap<String, Vec<Channel>>,
 }
 
 impl Node {
-    pub fn new(doc: &gltf::Document, source: &gltf::Node) -> Result<Self> {
+    pub fn new(ctx: &Context, source: &gltf::Node) -> Result<Self> {
         // TODO: Support node transforms. (Raylib doesn't like them so they're
         // not high priority.)
 
@@ -113,25 +129,25 @@ impl Node {
         let mut children = BTreeMap::new();
         for child in source.children() {
             let name = child.name().map_or_else(gensym, |n| n.to_string());
-            children.insert(name, Self::new(doc, &child)?);
+            children.insert(name, Self::new(ctx, &child)?);
         }
 
         let skin = source.skin().map(|s| Skin::new(&s)).transpose()?;
 
-        // XXX: Ignoring mesh weights. Do we need it?
+        // XXX: Ignoring mesh weights. Do we need them?
 
         let mesh = source
             .mesh()
             .map(|m| {
                 m.primitives()
-                    .map(|p| Primitive::new(&p))
+                    .map(|p| Primitive::new(ctx, &p))
                     .collect::<Result<_>>()
             })
             .transpose()?
             .unwrap_or_default();
 
         let mut animations = BTreeMap::new();
-        for a in doc.animations() {
+        for a in ctx.gltf.animations() {
             // Animations that affect multiple nodes are split into per-node
             // channel sets, does this make sense?
             //
@@ -148,7 +164,7 @@ impl Node {
             let name = a.name().map_or_else(gensym, |n| n.to_string());
             let channels: Vec<Channel> = a
                 .channels()
-                .map(|c| Channel::new(&c))
+                .map(|c| Channel::new(ctx, &c))
                 .collect::<Result<_>>()?;
             animations.insert(name, channels);
         }
@@ -164,7 +180,7 @@ impl Node {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "kebab-case")]
 enum Camera {
     Perspective {
         aspect_ratio: f32,
@@ -182,8 +198,8 @@ enum Camera {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct Skin {
-    joints: Vec<usize>,
-    inverse_bind_matrices: Vec<Mat4>,
+    pub joints: Vec<usize>,
+    pub inverse_bind_matrices: Vec<Mat4>,
 }
 
 impl Skin {
@@ -202,47 +218,127 @@ impl Skin {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
 struct Primitive {
-    attributes: Vec<Attribute>,
-    indices: Vec<usize>,
-    material: Material,
+    pub indices: Vec<u32>,
+    pub material: Material,
+
+    pub positions: Vec<Vec3>,
+    pub normals: Vec<Vec3>,
+    pub tex_coords: Vec<Vec2>,
+    pub joints: Vec<[u16; 4]>,
+    pub weights: Vec<Vec4>,
 }
 
 impl Primitive {
-    pub fn new(_source: &gltf::Primitive) -> Result<Self> {
-        // TODO: Parse primitive data, needs buffer access
-        Ok(Default::default())
-    }
-}
+    pub fn new(ctx: &Context, primitive: &gltf::Primitive) -> Result<Self> {
+        let reader =
+            primitive.reader(|buffer| ctx.buffers.get(buffer.index()).map(|b| b.0.as_slice()));
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-enum Attribute {
-    Position(Vec<Vec3>),
-    Normal(Vec<Vec3>),
-    TexCoord(Vec<Vec2>),
-    Joints(Vec<Vec4>),
-    Weights(Vec<Vec4>),
+        let indices = reader
+            .read_indices()
+            .expect("Primitive: No indices")
+            .into_u32()
+            .collect::<Vec<_>>();
+
+        let mut positions = Vec::new();
+        let mut normals = Vec::new();
+        let mut tex_coords = Vec::new();
+        let mut joints = Vec::new();
+        let mut weights = Vec::new();
+
+        if let Some(p) = reader.read_positions() {
+            positions = p.map(Vec3::from).collect();
+        }
+
+        if let Some(n) = reader.read_normals() {
+            normals = n.map(Vec3::from).collect();
+        }
+
+        if let Some(t) = reader.read_tex_coords(0) {
+            tex_coords = t.into_f32().map(Vec2::from).collect();
+        }
+
+        if let Some(j) = reader.read_joints(0) {
+            joints = j.into_u16().collect();
+        }
+
+        if let Some(w) = reader.read_weights(0) {
+            weights = w.into_f32().map(Vec4::from).collect();
+        }
+
+        // TODO: Parse primitive data, needs buffer access
+        Ok(Primitive {
+            indices,
+            positions,
+            normals,
+            tex_coords,
+            joints,
+            weights,
+            ..Default::default()
+        })
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct Material {
-    texture_map: Option<String>,
-    metallic_factor: f32,
-    roughness_factor: f32,
+    pub texture_map: Option<String>,
+    pub metallic_factor: f32,
+    pub roughness_factor: f32,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct Channel {
-    input: Vec<f32>,
-    output: Vec<f32>,
-    interpolation: Interpolation,
-    path: AnimPath,
+    pub interpolation: Interpolation,
+    pub path: AnimPath,
 }
 
 impl Channel {
-    pub fn new(_source: &gltf::animation::Channel) -> Result<Self> {
-        // TODO: Parse channel data, needs buffer access
-        Ok(Default::default())
+    pub fn new(ctx: &Context, channel: &gltf::animation::Channel) -> Result<Self> {
+        let interpolation = channel.sampler().interpolation().into();
+        let reader =
+            channel.reader(|buffer| ctx.buffers.get(buffer.index()).map(|b| b.0.as_slice()));
+        let timestamps: Vec<f32> = reader
+            .read_inputs()
+            .expect("Channel: No timestamps")
+            .collect();
+        let path = match reader.read_outputs().expect("Channel: No outputs") {
+            ReadOutputs::Translations(translations) => {
+                let translations: Vec<(f32, Vec3)> = translations
+                    .zip(timestamps.iter().copied())
+                    .map(|(t, s)| (s, Vec3::from(t)))
+                    .collect();
+                AnimPath::Translation(translations)
+            }
+            ReadOutputs::Rotations(rotations) => {
+                let rotations: Vec<(f32, Quat)> = rotations
+                    .into_f32()
+                    .zip(timestamps.iter().copied())
+                    .map(|(t, s)| (s, Quat::from_array(t)))
+                    .collect();
+                AnimPath::Rotation(rotations)
+            }
+            ReadOutputs::Scales(scales) => {
+                let scales: Vec<(f32, Vec3)> = scales
+                    .zip(timestamps.iter().copied())
+                    .map(|(t, s)| (s, Vec3::from(t)))
+                    .collect();
+                AnimPath::Scale(scales)
+            }
+            ReadOutputs::MorphTargetWeights(weights) => {
+                let weights: Vec<(f32, f32)> = weights
+                    .into_f32()
+                    .zip(timestamps.iter().copied())
+                    .map(|(t, s)| (s, t))
+                    .collect();
+                AnimPath::Weights(weights)
+            }
+        };
+        // TODO: Parse outputs, figure out the variant stuff.
+        Ok(Self {
+            interpolation,
+            path,
+        })
     }
 }
 
@@ -254,13 +350,28 @@ enum Interpolation {
     CubicSpline,
 }
 
-#[derive(Copy, Clone, Debug, Default, Serialize, Deserialize)]
+impl From<gltf::animation::Interpolation> for Interpolation {
+    fn from(i: gltf::animation::Interpolation) -> Self {
+        match i {
+            gltf::animation::Interpolation::Linear => Self::Linear,
+            gltf::animation::Interpolation::Step => Self::Step,
+            gltf::animation::Interpolation::CubicSpline => Self::CubicSpline,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 enum AnimPath {
-    #[default]
-    Translation,
-    Rotation,
-    Scale,
-    Weights,
+    Translation(Vec<(f32, Vec3)>),
+    Rotation(Vec<(f32, Quat)>),
+    Scale(Vec<(f32, Vec3)>),
+    Weights(Vec<(f32, f32)>),
+}
+
+impl Default for AnimPath {
+    fn default() -> Self {
+        Self::Translation(Vec::new())
+    }
 }
 
 /// Hacky unique name generator for missing name data.
