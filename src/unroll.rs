@@ -230,12 +230,14 @@ impl Skin {
             })
             .collect::<Result<Vec<String>>>()?;
 
-        let inverse_bind_matrices = source
+        let inverse_bind_matrices = if let Some(ibm) = source
             .reader(|buffer| ctx.buffers.get(buffer.index()).map(|b| b.0.as_slice()))
             .read_inverse_bind_matrices()
-            .expect("Skin: No inverse bind matrices")
-            .map(Mat4::from)
-            .collect();
+        {
+            ibm.map(Mat4::from).collect()
+        } else {
+            Default::default()
+        };
 
         Ok(Self {
             joints,

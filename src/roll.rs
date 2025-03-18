@@ -168,6 +168,8 @@ impl Roller {
         compute_bounds: bool,
         target: Option<json::buffer::Target>,
     ) -> usize {
+        assert!(!data.is_empty(), "Pushing empty data array");
+
         // Get raw byte data.
         let raw_data: Vec<u8> = unsafe {
             std::slice::from_raw_parts(data.as_ptr() as *const u8, std::mem::size_of_val(data))
@@ -441,9 +443,13 @@ impl Roller {
     }
 
     fn push_skin(&mut self, skin: &Skin) -> usize {
-        let inverse_bind_matrices = Some(json::Index::new(
-            self.push_data(&skin.inverse_bind_matrices) as u32,
-        ));
+        let inverse_bind_matrices = if skin.inverse_bind_matrices.is_empty() {
+            None
+        } else {
+            Some(json::Index::new(
+                self.push_data(&skin.inverse_bind_matrices) as u32,
+            ))
+        };
 
         self.skins.push(json::Skin {
             inverse_bind_matrices,
