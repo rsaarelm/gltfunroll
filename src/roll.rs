@@ -1,4 +1,7 @@
-use std::collections::BTreeMap;
+use std::{
+    any::TypeId,
+    collections::{BTreeMap, HashMap},
+};
 
 use glam::{Quat, Vec2, Vec3, Vec4};
 use gltf_json::{
@@ -8,17 +11,26 @@ use gltf_json::{
     validation::{Checked, USize64},
 };
 
-use crate::{unroll::NodeIter, AnimPath, Channel, Mat4, Node, NodeData, Primitive, Skin, VERSION};
+use crate::{
+    unroll::NodeIter, Animation, Mat4, Material, Node, NodeData, Primitive, Skin, VERSION,
+};
 
 /// Context object for rebuilding a glTF file from a `Node` tree.
 #[derive(Clone, Debug)]
 pub(crate) struct Roller {
+    /// Name of the file and the first node.
+    pub root_name: String,
+
+    /// Map of data buffers that were already inserted, use for deduplication.
+    pub buffers: HashMap<(TypeId, Vec<u8>), usize>,
     pub names: BTreeMap<String, usize>,
+    pub textures: BTreeMap<String, usize>,
 
     pub accessors: Vec<json::Accessor>,
     pub animations: Vec<json::Animation>,
     pub buffer: Vec<u8>,
     pub buffer_views: Vec<json::buffer::View>,
+    pub materials: Vec<json::Material>,
     pub meshes: Vec<json::Mesh>,
     pub nodes: Vec<json::Node>,
     pub skins: Vec<json::Skin>,
@@ -26,6 +38,8 @@ pub(crate) struct Roller {
 
 impl From<Roller> for json::Root {
     fn from(ctx: Roller) -> Self {
+        let num_textures = ctx.textures.len();
+
         json::Root {
             accessors: ctx.accessors,
             animations: ctx.animations,
@@ -37,7 +51,7 @@ impl From<Roller> for json::Root {
             buffer_views: ctx.buffer_views.clone(),
             buffers: vec![json::Buffer {
                 byte_length: USize64::from(ctx.buffer.len()),
-                uri: None,
+                uri: Some(format!("{}.bin", ctx.root_name)),
                 name: None,
                 extensions: Default::default(),
                 extras: Default::default(),
@@ -49,14 +63,27 @@ impl From<Roller> for json::Root {
             extensions_required: Default::default(),
             extras: Default::default(),
 
-            // TODO Roll in texture map names
-            images: Default::default(),
+            // Push the collected textures in index order into the image list.
+            images: {
+                let mut images = ctx.textures.into_iter().collect::<Vec<_>>();
+                images.sort_by_key(|(_, idx)| *idx);
+                images
+                    .into_iter()
+                    .map(|(name, _)| json::Image {
+                        buffer_view: None,
+                        mime_type: None,
+                        uri: Some(name),
+                        name: None,
+                        extensions: Default::default(),
+                        extras: Default::default(),
+                    })
+                    .collect()
+            },
 
-            // TODO Roll in materials
-            materials: Default::default(),
+            materials: ctx.materials,
             meshes: ctx.meshes,
             nodes: ctx.nodes,
-            // TODO Roll in texture samplers
+
             samplers: Default::default(),
 
             // Default scene that has the zeroth node as the root.
@@ -69,8 +96,18 @@ impl From<Roller> for json::Root {
             }],
 
             skins: ctx.skins,
-            // TODO Roll in textures
-            textures: Default::default(),
+
+            // One texture for each image, no extra data needed here.
+            textures: (0..num_textures)
+                .map(|i| json::Texture {
+                    source: json::Index::new(i as u32),
+
+                    sampler: Default::default(),
+                    extensions: Default::default(),
+                    extras: Default::default(),
+                    name: Default::default(),
+                })
+                .collect(),
         }
     }
 }
@@ -78,38 +115,79 @@ impl From<Roller> for json::Root {
 impl Roller {
     /// Build the roller, initialize name lookup for the node tree.
     pub fn new(root_name: impl Into<String>, root: &Node) -> Self {
+        let root_name = root_name.into();
         let mut names = BTreeMap::new();
-        for (i, (name, _, _)) in NodeIter::new(root_name.into(), root).enumerate() {
+        for (i, (name, _, _)) in NodeIter::new(root_name.clone(), root).enumerate() {
             names.insert(name, i);
         }
 
         Self {
+            root_name,
+
+            buffers: Default::default(),
             names,
+            textures: Default::default(),
 
             accessors: Default::default(),
             animations: Default::default(),
             buffer: Default::default(),
             buffer_views: Default::default(),
+            materials: Default::default(),
             meshes: Default::default(),
             nodes: Default::default(),
             skins: Default::default(),
         }
     }
 
+    pub fn push_data<E: BufferValue>(&mut self, data: &[E]) -> usize {
+        self.push_data_inner(data, false, None)
+    }
+
+    pub fn push_input_data(&mut self, data: &[f32]) -> usize {
+        self.push_data_inner(data, true, None)
+    }
+
+    pub fn push_index_data(&mut self, data: &[u32]) -> usize {
+        self.push_data_inner(data, false, Some(json::buffer::Target::ElementArrayBuffer))
+    }
+
+    pub fn push_position_data(&mut self, data: &[Vec3]) -> usize {
+        self.push_data_inner(data, true, Some(json::buffer::Target::ArrayBuffer))
+    }
+
+    pub fn push_attribute_data<E: BufferValue>(&mut self, data: &[E]) -> usize {
+        self.push_data_inner(data, false, Some(json::buffer::Target::ArrayBuffer))
+    }
+
     /// Push a buffer of data into the output glTF.
     ///
     /// Return the accessor index for the data.
-    pub fn push_data<E>(&mut self, data: &[E], compute_bounds: bool) -> usize
-    where
-        E: BufferValue,
-    {
+    fn push_data_inner<E: BufferValue>(
+        &mut self,
+        data: &[E],
+        compute_bounds: bool,
+        target: Option<json::buffer::Target>,
+    ) -> usize {
+        // Get raw byte data.
+        let raw_data: Vec<u8> = unsafe {
+            std::slice::from_raw_parts(data.as_ptr() as *const u8, std::mem::size_of_val(data))
+                .to_vec()
+        };
+        let type_id = TypeId::of::<E>();
+
+        // Check if the buffer is already present.
+        if let Some(idx) = self.buffers.get(&(type_id, raw_data.clone())) {
+            return *idx;
+        } else {
+            let idx = self.buffers.len();
+            self.buffers.insert((type_id, raw_data.clone()), idx);
+        }
+
         // Add the actual data bytes to the buffer.
         let offset = self.buffer.len();
         let size = std::mem::size_of_val(data);
 
-        self.buffer.extend_from_slice(unsafe {
-            std::slice::from_raw_parts(data.as_ptr() as *const u8, size)
-        });
+        self.buffer.extend_from_slice(&raw_data);
 
         let (min, max) = if compute_bounds {
             (
@@ -132,7 +210,7 @@ impl Roller {
             byte_length: USize64::from(size),
             byte_offset: Some(USize64::from(offset)),
             byte_stride: None,
-            target: None,
+            target: target.map(Checked::Valid),
             name: None,
             extensions: Default::default(),
             extras: Default::default(),
@@ -197,8 +275,8 @@ impl Roller {
         }
 
         // Animations
-        for (name, channels) in &node.animations {
-            self.add_anim_channels(idx, name, channels);
+        for (name, animation) in &node.animations {
+            self.add_anim_channels(idx, name, animation);
         }
 
         self.nodes.push(output);
@@ -220,44 +298,47 @@ impl Roller {
     fn make_primitive(&mut self, p: &Primitive) -> json::mesh::Primitive {
         // Remove the IDM-nicety clumping.
         let indices = p.indices.iter().flatten().copied().collect::<Vec<_>>();
-        let indices = self.push_data(&indices, false);
+        let indices = self.push_index_data(&indices);
 
         let mut attributes = BTreeMap::new();
 
         if !p.positions.is_empty() {
             attributes.insert(
                 Checked::Valid(json::mesh::Semantic::Positions),
-                json::Index::new(self.push_data(&p.positions, true) as u32),
+                json::Index::new(self.push_position_data(&p.positions) as u32),
             );
         }
 
         if !p.normals.is_empty() {
             attributes.insert(
                 Checked::Valid(json::mesh::Semantic::Normals),
-                json::Index::new(self.push_data(&p.normals, false) as u32),
+                json::Index::new(self.push_attribute_data(&p.normals) as u32),
             );
         }
 
         if !p.tex_coords.is_empty() {
             attributes.insert(
                 Checked::Valid(json::mesh::Semantic::TexCoords(0)),
-                json::Index::new(self.push_data(&p.tex_coords, false) as u32),
+                json::Index::new(self.push_attribute_data(&p.tex_coords) as u32),
             );
         }
 
         if !p.joints.is_empty() {
             attributes.insert(
                 Checked::Valid(json::mesh::Semantic::Joints(0)),
-                json::Index::new(self.push_data(&p.joints, false) as u32),
+                json::Index::new(self.push_attribute_data(&p.joints) as u32),
             );
         }
 
         if !p.weights.is_empty() {
             attributes.insert(
                 Checked::Valid(json::mesh::Semantic::Weights(0)),
-                json::Index::new(self.push_data(&p.weights, false) as u32),
+                json::Index::new(self.push_attribute_data(&p.weights) as u32),
             );
         }
+
+        let material = (!p.material.is_empty())
+            .then(|| json::Index::new(self.push_material(&p.material) as u32));
 
         json::mesh::Primitive {
             indices: Some(json::Index::new(indices as u32)),
@@ -266,16 +347,102 @@ impl Roller {
             extensions: None,
             extras: Default::default(),
 
-            // TODO: Assign material to primitive.
-            material: None,
+            material,
             mode: Checked::Valid(json::mesh::Mode::Triangles),
             targets: None,
         }
     }
 
+    fn push_material(&mut self, material: &Material) -> usize {
+        // Try to reuse an existing material.
+
+        // The material has textures defined which aren't found in our texture
+        // list yet. This must be a new material so we just add it.
+        if matches!(material.base_color_texture, Some(ref t) if !self.textures.contains_key(t))
+            || matches!(
+                material.metallic_roughness_texture,
+                Some(ref t) if !self.textures.contains_key(t)
+            )
+        {
+            return self.add_material(material);
+        }
+
+        for (i, m) in self.materials.iter().enumerate() {
+            if m.pbr_metallic_roughness
+                .base_color_texture
+                .as_ref()
+                .map(|t| t.index.value())
+                == material
+                    .base_color_texture
+                    .as_ref()
+                    .map(|t| *self.textures.get(t).unwrap())
+                && m.pbr_metallic_roughness
+                    .metallic_roughness_texture
+                    .as_ref()
+                    .map(|t| t.index.value())
+                    == material
+                        .metallic_roughness_texture
+                        .as_ref()
+                        .map(|t| *self.textures.get(t).unwrap())
+            {
+                return i;
+            }
+        }
+
+        self.add_material(material)
+    }
+
+    fn add_material(&mut self, material: &Material) -> usize {
+        // Insert textures if they aren't known yet.
+        if let Some(ref t) = material.base_color_texture {
+            if !self.textures.contains_key(t) {
+                self.textures.insert(t.clone(), self.textures.len());
+            }
+        }
+
+        if let Some(ref t) = material.metallic_roughness_texture {
+            if !self.textures.contains_key(t) {
+                self.textures.insert(t.clone(), self.textures.len());
+            }
+        }
+
+        let base_color_texture =
+            material
+                .base_color_texture
+                .as_ref()
+                .map(|t| json::texture::Info {
+                    index: json::Index::new(*self.textures.get(t).unwrap() as u32),
+                    tex_coord: 0,
+                    extensions: Default::default(),
+                    extras: Default::default(),
+                });
+
+        let metallic_roughness_texture =
+            material
+                .metallic_roughness_texture
+                .as_ref()
+                .map(|t| json::texture::Info {
+                    index: json::Index::new(*self.textures.get(t).unwrap() as u32),
+                    tex_coord: 0,
+                    extensions: Default::default(),
+                    extras: Default::default(),
+                });
+
+        self.materials.push(json::Material {
+            pbr_metallic_roughness: json::material::PbrMetallicRoughness {
+                base_color_texture,
+                metallic_roughness_texture,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        self.materials.len() - 1
+    }
+
     fn push_skin(&mut self, skin: &Skin) -> usize {
         let inverse_bind_matrices = Some(json::Index::new(
-            self.push_data(&skin.inverse_bind_matrices, false) as u32,
+            self.push_data(&skin.inverse_bind_matrices) as u32,
         ));
 
         self.skins.push(json::Skin {
@@ -299,7 +466,7 @@ impl Roller {
         self.skins.len() - 1
     }
 
-    fn add_anim_channels(&mut self, node_id: usize, name: &str, channels: &[Channel]) {
+    fn add_anim_channels(&mut self, node_id: usize, name: &str, animation: &Animation) {
         // Find animation with the given name. If it doesn't exist, create it.
         let anim_idx = if let Some(idx) = self
             .animations
@@ -318,42 +485,42 @@ impl Roller {
             self.animations.len() - 1
         };
 
-        for c in channels {
-            // split anim path into type (the enum variant), input timestamps (first
-            // items of value tuples) and output values (second items of value
-            // tuples)
-            let (path_type, input, output) = match &c.path {
-                AnimPath::Translation(t) => {
-                    let (input, output): (Vec<f32>, Vec<Vec3>) = t.iter().copied().unzip();
-                    let (input, output) =
-                        (self.push_data(&input, true), self.push_data(&output, false));
-                    (json::animation::Property::Translation, input, output)
-                }
-                AnimPath::Rotation(t) => {
-                    let (input, output): (Vec<f32>, Vec<Quat>) = t.iter().copied().unzip();
-                    let (input, output) =
-                        (self.push_data(&input, true), self.push_data(&output, false));
-                    (json::animation::Property::Rotation, input, output)
-                }
-                AnimPath::Scale(t) => {
-                    let (input, output): (Vec<f32>, Vec<Vec3>) = t.iter().copied().unzip();
-                    let (input, output) =
-                        (self.push_data(&input, true), self.push_data(&output, false));
-                    (json::animation::Property::Scale, input, output)
-                }
-                AnimPath::Weights(t) => {
-                    let (input, output): (Vec<f32>, Vec<f32>) = t.iter().copied().unzip();
-                    let (input, output) =
-                        (self.push_data(&input, true), self.push_data(&output, false));
-                    (json::animation::Property::MorphTargetWeights, input, output)
-                }
-            };
+        // (path_type, input, output)
+        let mut channels = Vec::new();
 
+        if !animation.translation.is_empty() {
+            let (input, output): (Vec<f32>, Vec<Vec3>) =
+                animation.translation.iter().copied().unzip();
+            let (input, output) = (self.push_input_data(&input), self.push_data(&output));
+            channels.push((json::animation::Property::Translation, input, output));
+        }
+
+        if !animation.rotation.is_empty() {
+            let (input, output): (Vec<f32>, Vec<Quat>) = animation.rotation.iter().copied().unzip();
+            let (input, output) = (self.push_input_data(&input), self.push_data(&output));
+            channels.push((json::animation::Property::Rotation, input, output));
+        }
+
+        if !animation.scale.is_empty() {
+            let (input, output): (Vec<f32>, Vec<Vec3>) = animation.scale.iter().copied().unzip();
+            let (input, output) = (self.push_input_data(&input), self.push_data(&output));
+            channels.push((json::animation::Property::Scale, input, output));
+        }
+
+        if !animation.weight.is_empty() {
+            let (input, output): (Vec<f32>, Vec<f32>) = animation.weight.iter().copied().unzip();
+            let (input, output) = (self.push_input_data(&input), self.push_data(&output));
+            channels.push((json::animation::Property::MorphTargetWeights, input, output));
+        }
+
+        for (path_type, input, output) in channels {
             self.animations[anim_idx]
                 .samplers
                 .push(json::animation::Sampler {
                     input: json::Index::new(input as u32),
-                    interpolation: Checked::Valid(c.interpolation.into()),
+                    // XXX: Always use linear interpolation, the engine I use
+                    // only supports that.
+                    interpolation: Checked::Valid(json::animation::Interpolation::Linear),
                     output: json::Index::new(output as u32),
                     extensions: Default::default(),
                     extras: Default::default(),
@@ -392,7 +559,7 @@ impl BufferValue for u32 {
     const TYPE: Type = Type::Scalar;
 
     fn value(&self) -> json::Value {
-        json::Value::from(*self)
+        json::Value::from(vec![*self])
     }
 
     fn min(self, other: Self) -> Self {
@@ -426,7 +593,7 @@ impl BufferValue for f32 {
     const TYPE: Type = Type::Scalar;
 
     fn value(&self) -> json::Value {
-        json::Value::from(*self)
+        json::Value::from(vec![*self])
     }
 
     fn min(self, other: Self) -> Self {

@@ -8,7 +8,7 @@ use glam::{Quat, Vec2, Vec3, Vec4};
 use gltf::animation::util::ReadOutputs;
 use serde::{Deserialize, Serialize};
 
-use crate::{gensym, Mat4};
+use crate::Mat4;
 
 // Because the output is IDM, the contents of the node are wrapped in this
 // struct that expresses the tree structure. Actual contents, other than names
@@ -24,7 +24,7 @@ impl Node {
         // work.
         let mut children = BTreeMap::new();
         for child in source.children() {
-            let name = child.name().map_or_else(crate::gensym, |n| n.to_string());
+            let name = ctx.node_names[child.index()].clone();
             children.insert(name, Self::new(ctx, &child)?);
         }
 
@@ -64,25 +64,21 @@ impl Node {
 
         let mut animations = BTreeMap::new();
         for a in ctx.gltf.animations() {
-            // Animations that affect multiple nodes are split into per-node
-            // channel sets, does this make sense?
-            //
-            // We can hopefully merge the animations back during roll stage
-            // based on names.
-            let channels = a
-                .channels()
-                .filter(|c| c.target().node().index() == source.index())
-                .collect::<Vec<_>>();
-            if channels.is_empty() {
-                continue;
+            let name = ctx.anim_names[a.index()].clone();
+
+            // Split out bits of animation that apply to this node and collect
+            // them into the Animation object.
+            let mut animation = Animation::default();
+            for c in a.channels() {
+                if c.target().node().index() != source.index() {
+                    continue;
+                }
+                animation.add_channel(ctx, &c)?;
             }
 
-            let name = a.name().map_or_else(gensym, |n| n.to_string());
-            let channels: Vec<Channel> = a
-                .channels()
-                .map(|c| Channel::new(ctx, &c))
-                .collect::<Result<_>>()?;
-            animations.insert(name, channels);
+            if !animation.is_empty() {
+                animations.insert(name, animation);
+            }
         }
 
         Ok(Node(
@@ -92,7 +88,7 @@ impl Node {
                 transform,
                 transform_matrix,
                 animations,
-                ..Default::default()
+                camera: Default::default(),
             },),
             children,
         ))
@@ -151,7 +147,7 @@ pub struct NodeData {
     pub camera: Option<Camera>,
     // Animation implicitly attached to one node.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    pub animations: BTreeMap<String, Vec<Channel>>,
+    pub animations: BTreeMap<String, Animation>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -257,6 +253,7 @@ pub struct Primitive {
     pub joints: Vec<[u16; 4]>,
     pub weights: Vec<Vec4>,
 
+    #[serde(skip_serializing_if = "Material::is_empty")]
     pub material: Material,
 }
 
@@ -298,6 +295,8 @@ impl Primitive {
             weights = w.into_f32().map(Vec4::from).collect();
         }
 
+        let material = Material::new(&primitive.material())?;
+
         Ok(Primitive {
             indices,
             positions,
@@ -305,7 +304,7 @@ impl Primitive {
             tex_coords,
             joints,
             weights,
-            ..Default::default()
+            material,
         })
     }
 }
@@ -313,117 +312,146 @@ impl Primitive {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
 pub struct Material {
-    pub texture_map: Option<String>,
-    pub metallic_factor: f32,
-    pub roughness_factor: f32,
+    pub base_color_texture: Option<String>,
+    pub metallic_roughness_texture: Option<String>,
+}
+
+// Add rest of the material stuff, texture samplers etc. if needed. For now
+// assume default values are good.
+
+impl Material {
+    pub(crate) fn new(material: &gltf::Material) -> Result<Self> {
+        let pbr = material.pbr_metallic_roughness();
+
+        let base_color_texture =
+            pbr.base_color_texture()
+                .and_then(|t| match t.texture().source().source() {
+                    gltf::image::Source::View { .. } => None,
+                    gltf::image::Source::Uri { uri, .. } => Some(uri.to_string()),
+                });
+
+        let metallic_roughness_texture =
+            pbr.metallic_roughness_texture()
+                .and_then(|t| match t.texture().source().source() {
+                    gltf::image::Source::View { .. } => None,
+                    gltf::image::Source::Uri { uri, .. } => Some(uri.to_string()),
+                });
+
+        Ok(Self {
+            base_color_texture,
+            metallic_roughness_texture,
+        })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.base_color_texture.is_none() && self.metallic_roughness_texture.is_none()
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct Channel {
-    pub interpolation: Interpolation,
-    pub path: AnimPath,
+#[serde(default)]
+pub struct Animation {
+    pub translation: Vec<(f32, Vec3)>,
+    pub rotation: Vec<(f32, Quat)>,
+    pub scale: Vec<(f32, Vec3)>,
+    pub weight: Vec<(f32, f32)>,
 }
 
-impl Channel {
-    pub(crate) fn new(ctx: &Unroller, channel: &gltf::animation::Channel) -> Result<Self> {
-        let interpolation = channel.sampler().interpolation().into();
+impl Animation {
+    pub fn is_empty(&self) -> bool {
+        self.translation.is_empty()
+            && self.rotation.is_empty()
+            && self.scale.is_empty()
+            && self.weight.is_empty()
+    }
+
+    pub(crate) fn add_channel(
+        &mut self,
+        ctx: &Unroller,
+        channel: &gltf::animation::Channel,
+    ) -> Result<()> {
         let reader =
             channel.reader(|buffer| ctx.buffers.get(buffer.index()).map(|b| b.0.as_slice()));
         let timestamps: Vec<f32> = reader
             .read_inputs()
             .expect("Channel: No timestamps")
             .collect();
-        let path = match reader.read_outputs().expect("Channel: No outputs") {
+
+        match reader.read_outputs().expect("Channel: No outputs") {
             ReadOutputs::Translations(translations) => {
-                let translations: Vec<(f32, Vec3)> = translations
+                self.translation = translations
                     .zip(timestamps.iter().copied())
                     .map(|(t, s)| (s, Vec3::from(t)))
-                    .collect();
-                AnimPath::Translation(translations)
+                    .collect()
             }
+
             ReadOutputs::Rotations(rotations) => {
-                let rotations: Vec<(f32, Quat)> = rotations
+                self.rotation = rotations
                     .into_f32()
                     .zip(timestamps.iter().copied())
                     .map(|(t, s)| (s, Quat::from_array(t)))
-                    .collect();
-                AnimPath::Rotation(rotations)
+                    .collect()
             }
+
             ReadOutputs::Scales(scales) => {
-                let scales: Vec<(f32, Vec3)> = scales
+                self.scale = scales
                     .zip(timestamps.iter().copied())
                     .map(|(t, s)| (s, Vec3::from(t)))
-                    .collect();
-                AnimPath::Scale(scales)
+                    .collect()
             }
+
             ReadOutputs::MorphTargetWeights(weights) => {
-                let weights: Vec<(f32, f32)> = weights
+                self.weight = weights
                     .into_f32()
                     .zip(timestamps.iter().copied())
                     .map(|(t, s)| (s, t))
-                    .collect();
-                AnimPath::Weights(weights)
+                    .collect()
             }
-        };
-
-        Ok(Self {
-            interpolation,
-            path,
-        })
-    }
-}
-
-#[derive(Copy, Clone, Debug, Default, Serialize, Deserialize)]
-pub enum Interpolation {
-    #[default]
-    Linear,
-    Step,
-    CubicSpline,
-}
-
-impl From<gltf::animation::Interpolation> for Interpolation {
-    fn from(i: gltf::animation::Interpolation) -> Self {
-        match i {
-            gltf::animation::Interpolation::Linear => Self::Linear,
-            gltf::animation::Interpolation::Step => Self::Step,
-            gltf::animation::Interpolation::CubicSpline => Self::CubicSpline,
         }
-    }
-}
 
-impl From<Interpolation> for gltf::animation::Interpolation {
-    fn from(i: Interpolation) -> Self {
-        match i {
-            Interpolation::Linear => gltf::animation::Interpolation::Linear,
-            Interpolation::Step => gltf::animation::Interpolation::Step,
-            Interpolation::CubicSpline => gltf::animation::Interpolation::CubicSpline,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum AnimPath {
-    Translation(Vec<(f32, Vec3)>),
-    Rotation(Vec<(f32, Quat)>),
-    Scale(Vec<(f32, Vec3)>),
-    Weights(Vec<(f32, f32)>),
-}
-
-impl Default for AnimPath {
-    fn default() -> Self {
-        Self::Translation(Vec::new())
+        Ok(())
     }
 }
 
 pub(crate) struct Unroller {
-    pub gltf: gltf::Document,
-    pub buffers: Vec<gltf::buffer::Data>,
+    gltf: gltf::Document,
+    buffers: Vec<gltf::buffer::Data>,
+
+    /// Original or generated names for all animations.
+    anim_names: Vec<String>,
+    /// Original or generated names for all meshes.
+    node_names: Vec<String>,
 }
 
 impl Unroller {
     pub fn new(path: impl AsRef<Path>) -> Result<Unroller> {
         let (gltf, buffers, _images) = gltf::import(path)?;
-        Ok(Unroller { gltf, buffers })
+
+        // Anyone who puts actual names in their data that end with '-gensym'
+        // deserves what they get.
+        let anim_names = gltf
+            .animations()
+            .enumerate()
+            .map(|(i, a)| {
+                a.name()
+                    .map_or_else(|| format!("anim-{}-gensym", i), |n| n.to_string())
+            })
+            .collect();
+        let node_names = gltf
+            .nodes()
+            .enumerate()
+            .map(|(i, a)| {
+                a.name()
+                    .map_or_else(|| format!("node-{}-gensym", i), |n| n.to_string())
+            })
+            .collect();
+
+        Ok(Unroller {
+            gltf,
+            buffers,
+            anim_names,
+            node_names,
+        })
     }
 
     pub fn root_node(&self) -> Result<gltf::Node> {

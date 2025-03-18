@@ -1,19 +1,5 @@
 use std::path::{Path, PathBuf};
 
-// TODO: Try filtering out animation paths that don't seem to change any
-// values along them. (Maybe make a --filter-paths CLI option)
-
-// TODO: Texture map names in IDM.
-
-// TODO: Texture filter (smooth vs nearest-neighbor) in IDM
-
-// TODO: Deduplicate buffers if you see repeats of the same data, eg. with
-// animation inputs. Roller needs a hashmap with type tag & byte vector as
-// key...
-
-// TODO: Unnamed animations are encountered repeatedly, do a gensym name only
-// once.
-
 use anyhow::{bail, Result};
 use clap::Parser;
 use gltf_json::{self as json};
@@ -23,7 +9,7 @@ use serde::{Deserialize, Serialize};
 mod roll;
 mod unroll;
 
-pub use unroll::{AnimPath, Camera, Channel, Material, Node, NodeData, Primitive, Skin, Trs};
+pub use unroll::{Animation, Camera, Material, Node, NodeData, Primitive, Skin, Trs};
 use unroll::{NodeIter, Unroller};
 
 pub(crate) const VERSION: Option<&str> = option_env!("CARGO_PKG_VERSION");
@@ -59,7 +45,8 @@ fn unroll(file: impl AsRef<Path>) -> Result<()> {
     let root = Node::new(&ctx, &ctx.root_node()?)?;
 
     // Serialize to IDM and write to disk.
-    safe_save(idm_file, idm::to_string(&root)?.as_bytes())?;
+    safe_save(&idm_file, idm::to_string(&root)?.as_bytes())?;
+    eprintln!("Unrolled to {}", idm_file.to_string_lossy());
 
     Ok(())
 }
@@ -91,9 +78,11 @@ fn roll(file: impl AsRef<Path>) -> Result<()> {
     // Write to disk.
     safe_save(bin_file, &roller.buffer)?;
     safe_save(
-        gltf_file,
+        &gltf_file,
         serde_json::to_string_pretty(&json::Root::from(roller))?.as_bytes(),
     )?;
+
+    eprintln!("Rolled to {}", gltf_file.to_string_lossy());
 
     Ok(())
 }
@@ -121,16 +110,6 @@ impl std::ops::Deref for Mat4 {
 
     fn deref(&self) -> &Self::Target {
         &self.0
-    }
-}
-
-/// Hacky unique name generator for missing name data.
-pub(crate) fn gensym() -> String {
-    static mut COUNTER: u32 = 0;
-    unsafe {
-        let counter = COUNTER;
-        COUNTER += 1;
-        format!("gensym-{counter}")
     }
 }
 
