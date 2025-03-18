@@ -77,10 +77,13 @@ fn roll(file: impl AsRef<Path>) -> Result<()> {
 
     // Write to disk.
     safe_save(bin_file, &roller.buffer)?;
-    safe_save(
-        &gltf_file,
-        serde_json::to_string_pretty(&json::Root::from(roller))?.as_bytes(),
-    )?;
+
+    let mut json = serde_json::to_string_pretty(&json::Root::from(roller))?;
+    if !json.ends_with('\n') {
+        json.push('\n');
+    }
+
+    safe_save(&gltf_file, json.as_bytes())?;
 
     eprintln!("Rolled to {}", gltf_file.to_string_lossy());
 
