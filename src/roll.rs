@@ -147,7 +147,7 @@ impl Roller {
         self.push_data_inner(data, true, None)
     }
 
-    pub fn push_index_data(&mut self, data: &[u32]) -> usize {
+    pub fn push_index_data(&mut self, data: &[u16]) -> usize {
         self.push_data_inner(data, false, Some(json::buffer::Target::ElementArrayBuffer))
     }
 
@@ -554,6 +554,23 @@ pub(crate) trait BufferValue: Copy + 'static {
     fn max(self, other: Self) -> Self;
 }
 
+impl BufferValue for u16 {
+    const COMPONENT_TYPE: ComponentType = ComponentType::U16;
+    const TYPE: Type = Type::Scalar;
+
+    fn value(&self) -> json::Value {
+        json::Value::from(vec![*self])
+    }
+
+    fn min(self, other: Self) -> Self {
+        std::cmp::Ord::min(self, other)
+    }
+
+    fn max(self, other: Self) -> Self {
+        std::cmp::Ord::max(self, other)
+    }
+}
+
 impl BufferValue for u32 {
     const COMPONENT_TYPE: ComponentType = ComponentType::U32;
     const TYPE: Type = Type::Scalar;
@@ -571,8 +588,8 @@ impl BufferValue for u32 {
     }
 }
 
-impl BufferValue for [u16; 4] {
-    const COMPONENT_TYPE: ComponentType = ComponentType::U16;
+impl BufferValue for [u8; 4] {
+    const COMPONENT_TYPE: ComponentType = ComponentType::U8;
     const TYPE: Type = Type::Vec4;
 
     fn value(&self) -> json::Value {

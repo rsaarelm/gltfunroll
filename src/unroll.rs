@@ -133,7 +133,7 @@ impl<'a> Iterator for NodeIter<'a> {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, rename_all = "kebab-case")]
 pub struct NodeData {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub mesh: Vec<Primitive>,
@@ -209,7 +209,7 @@ impl Default for Trs {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+#[serde(default, rename_all = "kebab-case")]
 pub struct Skin {
     pub joints: Vec<String>,
     pub inverse_bind_matrices: Vec<Mat4>,
@@ -245,12 +245,12 @@ impl Skin {
 pub struct Primitive {
     // Make these into chunks just so the IDM document does not end up with a
     // giant line.
-    pub indices: Vec<Vec<u32>>,
+    pub indices: Vec<Vec<u16>>,
 
     pub positions: Vec<Vec3>,
     pub normals: Vec<Vec3>,
     pub tex_coords: Vec<Vec2>,
-    pub joints: Vec<[u16; 4]>,
+    pub joints: Vec<[u8; 4]>,
     pub weights: Vec<Vec4>,
 
     #[serde(skip_serializing_if = "Material::is_empty")]
@@ -266,6 +266,7 @@ impl Primitive {
             .read_indices()
             .expect("Primitive: No indices")
             .into_u32()
+            .map(|i| i as u16)
             .collect::<Vec<_>>();
         let indices = indices.chunks(3).map(|c| c.to_vec()).collect();
 
@@ -288,7 +289,10 @@ impl Primitive {
         }
 
         if let Some(j) = reader.read_joints(0) {
-            joints = j.into_u16().collect();
+            joints = j
+                .into_u16()
+                .map(|[x, y, z, w]| [x as u8, y as u8, z as u8, w as u8])
+                .collect();
         }
 
         if let Some(w) = reader.read_weights(0) {
