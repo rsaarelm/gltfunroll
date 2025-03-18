@@ -55,12 +55,16 @@ impl Node {
         let mesh = source
             .mesh()
             .map(|m| {
-                m.primitives()
-                    .map(|p| Primitive::new(ctx, &p))
-                    .collect::<Result<_>>()
+                let prims = m.primitives().collect::<Vec<_>>();
+                if prims.len() > 1 {
+                    bail!("Node: Multiple primitives are not supported")
+                }
+                if prims.is_empty() {
+                    bail!("Node: Empty primitive list")
+                }
+                Primitive::new(ctx, &prims[0])
             })
-            .transpose()?
-            .unwrap_or_default();
+            .transpose()?;
 
         let mut animations = BTreeMap::new();
         for a in ctx.gltf.animations() {
@@ -135,16 +139,16 @@ impl<'a> Iterator for NodeIter<'a> {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
 pub struct NodeData {
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub mesh: Vec<Primitive>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub skin: Option<Skin>,
     #[serde(skip_serializing_if = "Trs::is_empty")]
     pub transform: Option<Trs>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transform_matrix: Option<Mat4>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub camera: Option<Camera>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skin: Option<Skin>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mesh: Option<Primitive>,
     // Animation implicitly attached to one node.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub animations: BTreeMap<String, Animation>,
