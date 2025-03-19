@@ -502,7 +502,12 @@ impl Roller {
         }
 
         if !animation.rotation.is_empty() {
-            let (input, output): (Vec<f32>, Vec<Quat>) = animation.rotation.iter().copied().unzip();
+            let (input, output): (Vec<f32>, Vec<Quat>) = animation
+                .rotation
+                .iter()
+                .copied()
+                .map(|(v, a)| (v, Quat::from(a)))
+                .unzip();
             let (input, output) = (self.push_input_data(&input), self.push_data(&output));
             channels.push((json::animation::Property::Rotation, input, output));
         }

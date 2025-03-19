@@ -4,12 +4,11 @@ use anyhow::{bail, Result};
 use clap::Parser;
 use gltf_json::{self as json};
 use roll::Roller;
-use serde::{Deserialize, Serialize};
 
 mod roll;
 mod unroll;
 
-pub use unroll::{Animation, Camera, Material, Node, NodeData, Primitive, Skin, Trs};
+pub use unroll::{Angle, Animation, Camera, Mat4, Material, Node, NodeData, Primitive, Skin, Trs};
 use unroll::{NodeIter, Unroller};
 
 pub(crate) const VERSION: Option<&str> = option_env!("CARGO_PKG_VERSION");
@@ -90,32 +89,6 @@ fn roll(file: impl AsRef<Path>) -> Result<()> {
     eprintln!("Rolled to {}", gltf_file.to_string_lossy());
 
     Ok(())
-}
-
-/// Custom wrapper type for Mat4, mostly so that we get a nice IDM
-/// serialization as four rows via the nested arrays serialization type.
-#[derive(Copy, Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(from = "[[f32; 4]; 4]", into = "[[f32; 4]; 4]")]
-pub struct Mat4(pub glam::Mat4);
-
-impl From<[[f32; 4]; 4]> for Mat4 {
-    fn from(m: [[f32; 4]; 4]) -> Self {
-        Self(glam::Mat4::from_cols_array_2d(&m))
-    }
-}
-
-impl From<Mat4> for [[f32; 4]; 4] {
-    fn from(m: Mat4) -> Self {
-        m.0.to_cols_array_2d()
-    }
-}
-
-impl std::ops::Deref for Mat4 {
-    type Target = glam::Mat4;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
 }
 
 fn safe_save(file: impl AsRef<Path>, data: impl AsRef<[u8]>) -> Result<()> {

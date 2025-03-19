@@ -8,8 +8,6 @@ use glam::{Quat, Vec2, Vec3, Vec4};
 use gltf::animation::util::ReadOutputs;
 use serde::{Deserialize, Serialize};
 
-use crate::Mat4;
-
 // Because the output is IDM, the contents of the node are wrapped in this
 // struct that expresses the tree structure. Actual contents, other than names
 // and children, are stored in NodeData. Serializing Nodes will produce nice
@@ -44,7 +42,7 @@ impl Node {
             } => {
                 transform = Some(Trs {
                     translation: Vec3::from(translation),
-                    rotation: Quat::from_array(rotation),
+                    rotation: Angle::from_array(rotation),
                     scale: Vec3::from(scale),
                 });
             }
@@ -176,8 +174,8 @@ pub enum Camera {
 pub struct Trs {
     #[serde(skip_serializing_if = "Trs::empty_translation")]
     pub translation: Vec3,
-    #[serde(skip_serializing_if = "Trs::empty_rotation")]
-    pub rotation: Quat,
+    #[serde(skip_serializing_if = "Angle::is_neutral")]
+    pub rotation: Angle,
     #[serde(skip_serializing_if = "Trs::empty_scale")]
     pub scale: Vec3,
 }
@@ -185,16 +183,12 @@ pub struct Trs {
 impl Trs {
     fn is_empty(trs: &Option<Self>) -> bool {
         trs.as_ref().map_or(true, |t| {
-            t.translation == Vec3::ZERO && t.rotation == Quat::IDENTITY && t.scale == Vec3::ONE
+            t.translation == Vec3::ZERO && t.rotation.is_neutral() && t.scale == Vec3::ONE
         })
     }
 
     fn empty_translation(vec: &Vec3) -> bool {
         *vec == Vec3::ZERO
-    }
-
-    fn empty_rotation(quat: &Quat) -> bool {
-        *quat == Quat::IDENTITY
     }
 
     fn empty_scale(vec: &Vec3) -> bool {
@@ -206,7 +200,7 @@ impl Default for Trs {
     fn default() -> Self {
         Self {
             translation: Vec3::ZERO,
-            rotation: Quat::IDENTITY,
+            rotation: Angle::default(),
             scale: Vec3::ONE,
         }
     }
@@ -362,7 +356,7 @@ impl Material {
 #[serde(default)]
 pub struct Animation {
     pub translation: Vec<(f32, Vec3)>,
-    pub rotation: Vec<(f32, Quat)>,
+    pub rotation: Vec<(f32, Angle)>,
     pub scale: Vec<(f32, Vec3)>,
     pub weight: Vec<(f32, f32)>,
 }
@@ -399,7 +393,7 @@ impl Animation {
                 self.rotation = rotations
                     .into_f32()
                     .zip(timestamps.iter().copied())
-                    .map(|(t, s)| (s, Quat::from_array(t)))
+                    .map(|(t, s)| (s, Angle::from_array(t)))
                     .collect()
             }
 
@@ -478,5 +472,111 @@ impl Unroller {
             bail!("Multiple root nodes found");
         }
         Ok(root_node)
+    }
+}
+
+/// Custom wrapper type for Mat4, mostly so that we get a nice IDM
+/// serialization as four rows via the nested arrays serialization type.
+#[derive(Copy, Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(from = "[[f32; 4]; 4]", into = "[[f32; 4]; 4]")]
+pub struct Mat4(pub glam::Mat4);
+
+impl From<[[f32; 4]; 4]> for Mat4 {
+    fn from(m: [[f32; 4]; 4]) -> Self {
+        Self(glam::Mat4::from_cols_array_2d(&m))
+    }
+}
+
+impl From<Mat4> for [[f32; 4]; 4] {
+    fn from(m: Mat4) -> Self {
+        m.0.to_cols_array_2d()
+    }
+}
+
+impl std::ops::Deref for Mat4 {
+    type Target = glam::Mat4;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Angle {
+    /// Quaternion. The recommended standard for storing rotations, but not at
+    /// all human-understandable.
+    Quat(Quat),
+
+    /// Euler angles for yaw, pitch and roll rotations, given in degrees. A
+    /// variant format for humans writing angles.
+    Euler(f32, f32, f32),
+}
+
+impl Angle {
+    pub fn from_array(a: [f32; 4]) -> Self {
+        Self::Quat(Quat::from_array(a))
+    }
+
+    pub fn to_array(&self) -> [f32; 4] {
+        match self {
+            Angle::Quat(q) => q.to_array(),
+            Angle::Euler(_, _, _) => Quat::from(*self).to_array(),
+        }
+    }
+
+    pub fn is_neutral(&self) -> bool {
+        match self {
+            Angle::Euler(x, y, z) => *x == 0.0 && *y == 0.0 && *z == 0.0,
+            Angle::Quat(q) => *q == Quat::IDENTITY,
+        }
+    }
+}
+
+impl Default for Angle {
+    fn default() -> Self {
+        Self::Quat(Quat::IDENTITY)
+    }
+}
+
+impl From<Quat> for Angle {
+    fn from(q: Quat) -> Self {
+        Self::Quat(q)
+    }
+}
+
+impl From<Angle> for Quat {
+    fn from(a: Angle) -> Self {
+        match a {
+            Angle::Quat(q) => q,
+            // Convert the degrees in v to radians.
+            Angle::Euler(x, y, z) => glam::Quat::from_euler(
+                glam::EulerRot::YXZ,
+                y.to_radians(),
+                x.to_radians(),
+                z.to_radians(),
+            ),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn angle_euler() {
+        assert_eq!(
+            Quat::from(Angle::Euler(90.0, 0.0, 0.0)),
+            Quat::from_rotation_x(90.0f32.to_radians())
+        );
+        assert_eq!(
+            Quat::from(Angle::Euler(0.0, 90.0, 0.0)),
+            Quat::from_rotation_y(90.0f32.to_radians())
+        );
+        assert_eq!(
+            Quat::from(Angle::Euler(0.0, 0.0, 90.0)),
+            Quat::from_rotation_z(90.0f32.to_radians())
+        );
     }
 }
