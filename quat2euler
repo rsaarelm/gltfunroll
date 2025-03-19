@@ -1,0 +1,94 @@
+#!/usr/bin/env rust-script
+
+//! Convert gltfunroll IDM file's quaternion angle values in stdin pipe into Euler angles.
+//!
+//! ```cargo
+//! [dependencies]
+//! glam = "0.30"
+//! ```
+
+use std::io::Read;
+
+use glam::quat;
+
+fn die(msg: &str) -> ! {
+    eprintln!("{}", msg);
+    std::process::exit(1)
+}
+
+fn main() {
+    // Read whole stdin to string
+    let mut input = String::new();
+    std::io::stdin().read_to_string(&mut input).unwrap();
+
+    let mut output = String::new();
+
+    // Accumulator for quaternion values.
+    let mut acc: Option<Vec<f32>> = None;
+    let mut cursor = input.as_str();
+    while !cursor.is_empty() {
+        let ((whitespace, token), rest) = token(cursor);
+        cursor = rest;
+
+        if token == "" {
+            output.push_str(whitespace);
+            break;
+        }
+
+        // State machine logic.
+        if let Some(elts) = acc.as_mut() {
+            // Collecting quaternion elements.
+            let Ok(elt) = token.parse::<f32>() else {
+                die("Invalid quaternion elements");
+            };
+
+            elts.push(elt);
+
+            // We got them all, output the Euler angle.
+            if elts.len() == 4 {
+                let quat = quat(elts[0], elts[1], elts[2], elts[3]);
+                let (y, x, z) = quat.to_euler(glam::EulerRot::YXZ);
+                let (x, y, z) = (x.to_degrees(), y.to_degrees(), z.to_degrees());
+                output.push_str(&format!("euler {x} {y} {z}"));
+                acc = None;
+            }
+        } else if token == "quat" {
+            // Start parsing a quaternion.
+            output.push_str(whitespace);
+            acc = Some(Vec::new());
+        } else {
+            output.push_str(whitespace);
+            output.push_str(token);
+        }
+    }
+    print!("{output}");
+}
+
+fn token(mut input: &str) -> ((&str, &str), &str) {
+    // See how much of initial input is whitespace.
+    let mut whitespace = "";
+
+    for (i, c) in input.char_indices() {
+        if !c.is_whitespace() {
+            whitespace = &input[..i];
+            input = &input[i..];
+            break;
+        }
+    }
+
+    let mut word = "";
+
+    for (i, c) in input.char_indices() {
+        if c.is_whitespace() {
+            word = &input[..i];
+            input = &input[i..];
+            break;
+        }
+    }
+    if word == "" {
+        word = input;
+        input = "";
+    }
+
+    ((whitespace, word), input)
+}

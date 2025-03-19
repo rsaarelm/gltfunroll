@@ -30,3 +30,5 @@ The glTF format uses quaternions internally, so an exported IDM file will always
 However, the type system also supports an Euler angles and degrees based variant.
 When manually editing the file, you can replace the quaternion value with `euler 0 90 0` to represent the same rotation.
 The rotation is applied in order Y (yaw) then X (pitch) then Z (roll).
+
+You can pipe bits of the IDM file through the `quat2euler` Rust-script included in the repository to convert the `quat` angles there to `euler` angles.
