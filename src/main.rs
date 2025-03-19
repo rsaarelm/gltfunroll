@@ -24,6 +24,8 @@ struct Args {
 }
 
 fn main() -> Result<()> {
+    env_logger::init();
+
     let args = Args::parse();
 
     match args.file.extension().unwrap().to_str().unwrap() {
@@ -120,6 +122,10 @@ fn safe_save(file: impl AsRef<Path>, data: impl AsRef<[u8]>) -> Result<()> {
     let file = file.as_ref();
     // If file already exists and is identical to data, do nothing.
     if file.exists() && std::fs::read(file)? == data.as_ref() {
+        log::info!(
+            "save: {} already exists and is equal to new contents, doing nothing",
+            file.to_string_lossy()
+        );
         return Ok(());
     }
 
@@ -134,43 +140,50 @@ fn safe_save(file: impl AsRef<Path>, data: impl AsRef<[u8]>) -> Result<()> {
 /// backup as long as the file does not change.
 fn backup(file: impl AsRef<Path>) -> Result<()> {
     let file = file.as_ref();
+    let file_name = file.to_string_lossy();
 
     if !file.exists() {
-        // No need to backup what ins't there.
+        log::info!("backup: No existing {file_name}, no need to do backups");
         return Ok(());
     }
 
     // Find the highest backup number.
     let mut highest = 1;
+    let backup_prefix = format!("{file_name}.");
     for entry in std::fs::read_dir(file.parent().unwrap())? {
-        let entry = entry?;
-        let path = entry.path();
-        let Some(ext) = path.extension() else {
-            continue;
-        };
-        if path.file_stem() != Some(file.as_os_str()) {
+        let path = entry?.path();
+        if !path.is_file() {
             continue;
         }
 
-        let Ok(n) = ext.to_string_lossy().parse::<u32>() else {
-            continue;
-        };
-        if n > highest {
-            highest = n;
+        let path_name = path.to_string_lossy();
+
+        // Look for existing backup files. For our {file_name}, they are
+        // {file_name}.1, {file_name}.2, and so on.
+        if let Some(ext) = path_name.strip_prefix(&backup_prefix) {
+            if let Ok(n) = ext.parse::<u32>() {
+                log::info!("backup: Found backup file {path_name}");
+                if n > highest {
+                    highest = n;
+                }
+            }
         }
     }
+
+    log::info!("backup: Last backup found is {file_name}.{highest}");
 
     let last_backup = PathBuf::from(format!("{}.{}", file.to_string_lossy(), highest));
 
     if last_backup.exists() && std::fs::read(file)? == std::fs::read(&last_backup)? {
-        eprintln!(
-            "{} is already backed up in {}",
-            file.to_string_lossy(),
+        log::info!(
+            "backup: {file_name} is already backed up in {}, doing nothing",
             last_backup.to_string_lossy()
         );
         return Ok(());
     }
 
-    std::fs::copy(file, &last_backup)?;
+    let backup_path = PathBuf::from(format!("{file_name}.{}", highest + 1));
+    log::info!("backup: Saving backup to {}", backup_path.to_string_lossy());
+    std::fs::copy(file, &backup_path)?;
     Ok(())
 }
