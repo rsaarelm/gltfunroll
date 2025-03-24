@@ -121,7 +121,7 @@ fn backup(file: impl AsRef<Path>) -> Result<()> {
     }
 
     // Find the highest backup number.
-    let mut highest = 1;
+    let mut highest = 0;
     let backup_prefix = format!("{file_name}.");
     for entry in std::fs::read_dir(file.parent().unwrap())? {
         let path = entry?.path();
