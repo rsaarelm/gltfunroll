@@ -50,19 +50,13 @@ impl Node {
 
         // XXX: We're ignoring morph targets and morph target weights for now.
 
-        let mesh = source
-            .mesh()
-            .map(|m| {
-                let prims = m.primitives().collect::<Vec<_>>();
-                if prims.len() > 1 {
-                    bail!("Node: Multiple primitives are not supported")
-                }
-                if prims.is_empty() {
-                    bail!("Node: Empty primitive list")
-                }
-                Primitive::new(ctx, &prims[0])
-            })
-            .transpose()?;
+        let mesh = if let Some(m) = source.mesh() {
+            m.primitives()
+                .map(|p| Primitive::new(ctx, &p))
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            Default::default()
+        };
 
         let mut animations = BTreeMap::new();
         for a in ctx.gltf.animations() {
@@ -145,8 +139,8 @@ pub struct NodeData {
     pub camera: Option<Camera>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skin: Option<Skin>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub mesh: Option<Primitive>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub mesh: Vec<Primitive>,
     // Animation implicitly attached to one node.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub animations: BTreeMap<String, Animation>,

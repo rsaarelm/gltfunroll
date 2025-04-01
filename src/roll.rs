@@ -271,8 +271,8 @@ impl Roller {
         }
 
         // Mesh
-        if let Some(mesh) = node.mesh.as_ref() {
-            let idx = self.push_mesh(mesh);
+        if !node.mesh.is_empty() {
+            let idx = self.push_mesh(&node.mesh);
             output.mesh = Some(json::Index::new(idx as u32));
         }
 
@@ -284,10 +284,10 @@ impl Roller {
         self.nodes.push(output);
     }
 
-    fn push_mesh(&mut self, mesh: &Primitive) -> usize {
-        let prim = self.make_primitive(mesh);
+    fn push_mesh(&mut self, mesh: &[Primitive]) -> usize {
+        let primitives = mesh.iter().map(|p| self.make_primitive(p)).collect();
         self.meshes.push(json::Mesh {
-            primitives: vec![prim],
+            primitives,
 
             extensions: None,
             extras: Default::default(),
