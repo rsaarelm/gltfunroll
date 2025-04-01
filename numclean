@@ -6,7 +6,7 @@
 use std::io::Read;
 
 fn main() {
-    const THRESHOLD: f64 = 0.0001;
+    const THRESHOLD: f64 = 0.000_002;
 
     // Read whole stdin to string
     let mut input = String::new();
@@ -28,14 +28,14 @@ fn main() {
         };
 
         // Go down some decimal places.
-        for scale in [1.0, 10.0, 100.0, 1000.0] {
+        for scale in [1.0, 10.0, 100.0, 1_000.0] {
             let a = num * scale;
             let mut rounded = a.round();
             if rounded == -0.0 {
                 rounded = 0.0;
             }
 
-            if (rounded - a).abs() < THRESHOLD {
+            if (rounded - a).abs() < THRESHOLD * scale {
                 num = rounded / scale;
                 break;
             }
