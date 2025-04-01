@@ -1,0 +1,75 @@
+#!/usr/bin/env rust-script
+
+//! Clean up floating-point numbers with small fractional parts into more readable-looking ones.
+//! 1.9999999 becomes 2, 0.449999999 becomes 0.45.
+
+use std::io::Read;
+
+fn main() {
+    const THRESHOLD: f64 = 0.0001;
+
+    // Read whole stdin to string
+    let mut input = String::new();
+    std::io::stdin().read_to_string(&mut input).unwrap();
+
+    let mut cursor = input.as_str();
+    while !cursor.is_empty() {
+        let ((whitespace, token), rest) = token(cursor);
+        cursor = rest;
+
+        print!("{whitespace}");
+        if token == "" {
+            break;
+        }
+
+        let Ok(mut num) = token.parse::<f64>() else {
+            print!("{token}");
+            continue;
+        };
+
+        // Go down some decimal places.
+        for scale in [1.0, 10.0, 100.0, 1000.0] {
+            let a = num * scale;
+            let mut rounded = a.round();
+            if rounded == -0.0 {
+                rounded = 0.0;
+            }
+
+            if (rounded - a).abs() < THRESHOLD {
+                num = rounded / scale;
+                break;
+            }
+        }
+
+        print!("{num}");
+    }
+}
+
+fn token(mut input: &str) -> ((&str, &str), &str) {
+    // See how much of initial input is whitespace.
+    let mut whitespace = "";
+
+    for (i, c) in input.char_indices() {
+        if !c.is_whitespace() {
+            whitespace = &input[..i];
+            input = &input[i..];
+            break;
+        }
+    }
+
+    let mut word = "";
+
+    for (i, c) in input.char_indices() {
+        if c.is_whitespace() {
+            word = &input[..i];
+            input = &input[i..];
+            break;
+        }
+    }
+    if word == "" {
+        word = input;
+        input = "";
+    }
+
+    ((whitespace, word), input)
+}
