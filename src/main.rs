@@ -8,7 +8,7 @@ use roll::Roller;
 mod roll;
 mod unroll;
 
-pub use unroll::{Angle, Animation, Camera, Mat4, Material, Node, NodeData, Primitive, Skin, Trs};
+pub use unroll::{Angle, Animation, Camera, Joint, Mat4, Material, Node, NodeData, Primitive, Trs};
 use unroll::{NodeIter, Unroller};
 
 pub(crate) const VERSION: Option<&str> = option_env!("CARGO_PKG_VERSION");

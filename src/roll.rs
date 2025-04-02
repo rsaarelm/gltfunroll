@@ -12,7 +12,7 @@ use gltf_json::{
 };
 
 use crate::{
-    unroll::NodeIter, Animation, Mat4, Material, Node, NodeData, Primitive, Skin, VERSION,
+    unroll::NodeIter, Animation, Joint, Mat4, Material, Node, NodeData, Primitive, VERSION,
 };
 
 /// Context object for rebuilding a glTF file from a `Node` tree.
@@ -265,8 +265,8 @@ impl Roller {
         }
 
         // Skin
-        if let Some(skin) = &node.skin {
-            let idx = self.push_skin(skin);
+        if !node.skin.is_empty() {
+            let idx = self.push_skin(&node.skin);
             output.skin = Some(json::Index::new(idx as u32));
         }
 
@@ -442,19 +442,23 @@ impl Roller {
         self.materials.len() - 1
     }
 
-    fn push_skin(&mut self, skin: &Skin) -> usize {
-        let inverse_bind_matrices = if skin.inverse_bind_matrices.is_empty() {
+    fn push_skin(&mut self, skin: &[Joint]) -> usize {
+        let mut matrices: Vec<Mat4> = skin.iter().map(|j| j.inverse_bind_matrix).collect();
+        let joints: Vec<String> = skin.iter().map(|j| j.name.clone()).collect();
+
+        if matrices.iter().all(Mat4::is_identity) {
+            matrices.clear();
+        }
+
+        let inverse_bind_matrices = if matrices.is_empty() {
             None
         } else {
-            Some(json::Index::new(
-                self.push_data(&skin.inverse_bind_matrices) as u32,
-            ))
+            Some(json::Index::new(self.push_data(&matrices) as u32))
         };
 
         self.skins.push(json::Skin {
             inverse_bind_matrices,
-            joints: skin
-                .joints
+            joints: joints
                 .iter()
                 .map(|j| {
                     json::Index::new(*self.names.get(j).unwrap_or_else(|| {

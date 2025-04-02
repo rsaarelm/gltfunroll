@@ -26,7 +26,10 @@ impl Node {
             children.insert(name, Self::new(ctx, &child)?);
         }
 
-        let skin = source.skin().map(|s| Skin::new(ctx, &s)).transpose()?;
+        let skin = source
+            .skin()
+            .map(|s| Joint::load_skin(ctx, &s))
+            .unwrap_or_else(|| Ok(Default::default()))?;
 
         // Flatten matrix/TRS transform into Node attribute level.
         let mut transform = None;
@@ -137,8 +140,8 @@ pub struct NodeData {
     pub transform_matrix: Option<Mat4>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub camera: Option<Camera>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub skin: Option<Skin>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub skin: Vec<Joint>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub mesh: Vec<Primitive>,
     // Animation implicitly attached to one node.
@@ -201,14 +204,24 @@ impl Default for Trs {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(default, rename_all = "kebab-case")]
-pub struct Skin {
-    pub joints: Vec<String>,
-    pub inverse_bind_matrices: Vec<Mat4>,
+#[serde(
+    from = "((String,), InverseBindMatrix)",
+    into = "((String,), InverseBindMatrix)"
+)]
+pub struct Joint {
+    pub name: String,
+    pub inverse_bind_matrix: Mat4,
 }
 
-impl Skin {
-    pub(crate) fn new(ctx: &Unroller, source: &gltf::Skin) -> Result<Self> {
+impl Joint {
+    pub(crate) fn new(name: String, inverse_bind_matrix: Mat4) -> Self {
+        Self {
+            name,
+            inverse_bind_matrix,
+        }
+    }
+
+    pub(crate) fn load_skin(ctx: &Unroller, source: &gltf::Skin) -> Result<Vec<Self>> {
         let joints: Vec<String> = source
             .joints()
             .map(|n| {
@@ -218,7 +231,7 @@ impl Skin {
             })
             .collect::<Result<Vec<String>>>()?;
 
-        let inverse_bind_matrices = if let Some(ibm) = source
+        let inverse_bind_matrices: Vec<Mat4> = if let Some(ibm) = source
             .reader(|buffer| ctx.buffers.get(buffer.index()).map(|b| b.0.as_slice()))
             .read_inverse_bind_matrices()
         {
@@ -227,11 +240,42 @@ impl Skin {
             Default::default()
         };
 
-        Ok(Self {
-            joints,
-            inverse_bind_matrices,
-        })
+        Ok(joints
+            .into_iter()
+            .enumerate()
+            .map(|(i, name)| {
+                Self::new(
+                    name,
+                    inverse_bind_matrices.get(i).copied().unwrap_or_default(),
+                )
+            })
+            .collect())
     }
+}
+
+impl From<((String,), InverseBindMatrix)> for Joint {
+    fn from(((name,), inverse_bind_matrix): ((String,), InverseBindMatrix)) -> Self {
+        Self::new(name, inverse_bind_matrix.inverse_bind_matrix)
+    }
+}
+
+impl From<Joint> for ((String,), InverseBindMatrix) {
+    fn from(joint: Joint) -> Self {
+        (
+            (joint.name,),
+            InverseBindMatrix {
+                inverse_bind_matrix: joint.inverse_bind_matrix,
+            },
+        )
+    }
+}
+
+// Dummy struct to make IDM layout nicer.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
+struct InverseBindMatrix {
+    #[serde(skip_serializing_if = "Mat4::is_identity")]
+    inverse_bind_matrix: Mat4,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -471,9 +515,15 @@ impl Unroller {
 
 /// Custom wrapper type for Mat4, mostly so that we get a nice IDM
 /// serialization as four rows via the nested arrays serialization type.
-#[derive(Copy, Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(from = "[[f32; 4]; 4]", into = "[[f32; 4]; 4]")]
 pub struct Mat4(pub glam::Mat4);
+
+impl Mat4 {
+    pub fn is_identity(&self) -> bool {
+        self.0 == glam::Mat4::IDENTITY
+    }
+}
 
 impl From<[[f32; 4]; 4]> for Mat4 {
     fn from(m: [[f32; 4]; 4]) -> Self {
