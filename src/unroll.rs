@@ -26,10 +26,17 @@ impl Node {
             children.insert(name, Self::new(ctx, &child)?);
         }
 
-        let skin = source
-            .skin()
-            .map(|s| Joint::load_skin(ctx, &s))
-            .unwrap_or_else(|| Ok(Default::default()))?;
+        let skin = if let Some(skin) = source.skin() {
+            skin.joints()
+                .map(|n| {
+                    n.name()
+                        .map(|n| n.to_string())
+                        .ok_or_else(|| anyhow::anyhow!("load_skin: Joint has no name"))
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
 
         // Flatten matrix/TRS transform into Node attribute level.
         let mut transform = None;
@@ -141,7 +148,7 @@ pub struct NodeData {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub camera: Option<Camera>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub skin: Vec<Joint>,
+    pub skin: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub mesh: Vec<Primitive>,
     // Animation implicitly attached to one node.
@@ -149,7 +156,21 @@ pub struct NodeData {
     pub animations: BTreeMap<String, Animation>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+impl NodeData {
+    pub fn get_transform(&self) -> Mat4 {
+        assert!(
+            !self.transform.is_some() || !self.transform_matrix.is_some(),
+            "NodeData: Two transforms specified"
+        );
+        if let Some(transform) = self.transform.as_ref() {
+            Mat4::from(*transform)
+        } else {
+            self.transform_matrix.unwrap_or_default()
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Camera {
     Perspective {
@@ -166,7 +187,7 @@ pub enum Camera {
     },
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Copy, Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Trs {
     #[serde(skip_serializing_if = "Trs::empty_translation")]
@@ -203,79 +224,14 @@ impl Default for Trs {
     }
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(
-    from = "((String,), InverseBindMatrix)",
-    into = "((String,), InverseBindMatrix)"
-)]
-pub struct Joint {
-    pub name: String,
-    pub inverse_bind_matrix: Mat4,
-}
-
-impl Joint {
-    pub(crate) fn new(name: String, inverse_bind_matrix: Mat4) -> Self {
-        Self {
-            name,
-            inverse_bind_matrix,
-        }
+impl From<Trs> for Mat4 {
+    fn from(trs: Trs) -> Self {
+        Mat4(glam::Mat4::from_scale_rotation_translation(
+            trs.scale,
+            trs.rotation.into(),
+            trs.translation,
+        ))
     }
-
-    pub(crate) fn load_skin(ctx: &Unroller, source: &gltf::Skin) -> Result<Vec<Self>> {
-        let joints: Vec<String> = source
-            .joints()
-            .map(|n| {
-                n.name()
-                    .map(|n| n.to_string())
-                    .ok_or_else(|| anyhow::anyhow!("Skin: Joint has no name"))
-            })
-            .collect::<Result<Vec<String>>>()?;
-
-        let inverse_bind_matrices: Vec<Mat4> = if let Some(ibm) = source
-            .reader(|buffer| ctx.buffers.get(buffer.index()).map(|b| b.0.as_slice()))
-            .read_inverse_bind_matrices()
-        {
-            ibm.map(Mat4::from).collect()
-        } else {
-            Default::default()
-        };
-
-        Ok(joints
-            .into_iter()
-            .enumerate()
-            .map(|(i, name)| {
-                Self::new(
-                    name,
-                    inverse_bind_matrices.get(i).copied().unwrap_or_default(),
-                )
-            })
-            .collect())
-    }
-}
-
-impl From<((String,), InverseBindMatrix)> for Joint {
-    fn from(((name,), inverse_bind_matrix): ((String,), InverseBindMatrix)) -> Self {
-        Self::new(name, inverse_bind_matrix.inverse_bind_matrix)
-    }
-}
-
-impl From<Joint> for ((String,), InverseBindMatrix) {
-    fn from(joint: Joint) -> Self {
-        (
-            (joint.name,),
-            InverseBindMatrix {
-                inverse_bind_matrix: joint.inverse_bind_matrix,
-            },
-        )
-    }
-}
-
-// Dummy struct to make IDM layout nicer.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(default, rename_all = "kebab-case")]
-struct InverseBindMatrix {
-    #[serde(skip_serializing_if = "Mat4::is_identity")]
-    inverse_bind_matrix: Mat4,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -523,6 +479,10 @@ impl Mat4 {
     pub fn is_identity(&self) -> bool {
         self.0 == glam::Mat4::IDENTITY
     }
+
+    pub fn inverse(&self) -> Self {
+        Self(self.0.inverse())
+    }
 }
 
 impl From<[[f32; 4]; 4]> for Mat4 {
@@ -542,6 +502,14 @@ impl std::ops::Deref for Mat4 {
 
     fn deref(&self) -> &Self::Target {
         &self.0
+    }
+}
+
+impl std::ops::Mul for Mat4 {
+    type Output = Self;
+
+    fn mul(self, rhs: Self) -> Self {
+        Self(self.0 * rhs.0)
     }
 }
 

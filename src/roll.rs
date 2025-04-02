@@ -11,9 +11,7 @@ use gltf_json::{
     validation::{Checked, USize64},
 };
 
-use crate::{
-    unroll::NodeIter, Animation, Joint, Mat4, Material, Node, NodeData, Primitive, VERSION,
-};
+use crate::{unroll::NodeIter, Animation, Mat4, Material, Node, NodeData, Primitive, VERSION};
 
 /// Context object for rebuilding a glTF file from a `Node` tree.
 #[derive(Clone, Debug)]
@@ -21,6 +19,8 @@ pub(crate) struct Roller {
     /// Name of the file and the first node.
     pub root_name: String,
 
+    /// Cumulative transformation matrices from scene graph.
+    pub node_transforms: HashMap<String, Mat4>,
     /// Map of data buffers that were already inserted, use for deduplication.
     pub buffers: HashMap<(TypeId, Vec<u8>), usize>,
     pub names: BTreeMap<String, usize>,
@@ -117,13 +117,27 @@ impl Roller {
     pub fn new(root_name: impl Into<String>, root: &Node) -> Self {
         let root_name = root_name.into();
         let mut names = BTreeMap::new();
-        for (i, (name, _, _)) in NodeIter::new(root_name.clone(), root).enumerate() {
-            names.insert(name, i);
+
+        // List of global transforms by node index.
+        let mut matrices = Vec::new();
+        let mut node_transforms = HashMap::new();
+        for (i, (name, node, parent_idx)) in NodeIter::new(root_name.clone(), root).enumerate() {
+            names.insert(name.clone(), i);
+            let mut transform = node.get_transform();
+            if let Some(parent_idx) = parent_idx {
+                // Multiply node's local transform by parent's global
+                // transform.
+                transform = matrices[parent_idx] * transform;
+            }
+            matrices.push(transform);
+
+            node_transforms.insert(name, transform);
         }
 
         Self {
             root_name,
 
+            node_transforms,
             buffers: Default::default(),
             names,
             textures: Default::default(),
@@ -442,23 +456,17 @@ impl Roller {
         self.materials.len() - 1
     }
 
-    fn push_skin(&mut self, skin: &[Joint]) -> usize {
-        let mut matrices: Vec<Mat4> = skin.iter().map(|j| j.inverse_bind_matrix).collect();
-        let joints: Vec<String> = skin.iter().map(|j| j.name.clone()).collect();
+    fn push_skin(&mut self, skin: &[String]) -> usize {
+        let matrices: Vec<Mat4> = skin
+            .iter()
+            .map(|name| self.node_transforms[name].inverse())
+            .collect();
 
-        if matrices.iter().all(Mat4::is_identity) {
-            matrices.clear();
-        }
-
-        let inverse_bind_matrices = if matrices.is_empty() {
-            None
-        } else {
-            Some(json::Index::new(self.push_data(&matrices) as u32))
-        };
+        let inverse_bind_matrices = Some(json::Index::new(self.push_data(&matrices) as u32));
 
         self.skins.push(json::Skin {
             inverse_bind_matrices,
-            joints: joints
+            joints: skin
                 .iter()
                 .map(|j| {
                     json::Index::new(*self.names.get(j).unwrap_or_else(|| {
