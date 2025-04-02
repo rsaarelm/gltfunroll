@@ -20,6 +20,16 @@ struct Args {
     /// File to transform. If .glb or .gltf, unroll to IDM. If .idm, roll to
     /// .gltf.
     pub file: PathBuf,
+
+    /// Do a roundtrip transformation back to the original format. You usually
+    /// want this from glTF to glTF, possibly with extra options.
+    #[clap(long)]
+    pub roundtrip: bool,
+
+    /// Fuse a scene graph with multiple transformed and animated mesh nodes
+    /// into a single root mesh with skeletal animation.
+    #[clap(long)]
+    pub skeletize: bool,
 }
 
 fn main() -> Result<()> {
@@ -28,51 +38,65 @@ fn main() -> Result<()> {
     let args = Args::parse();
 
     match args.file.extension().unwrap().to_str().unwrap() {
-        "glb" | "gltf" => unroll(&args.file),
-        "idm" => roll(&args.file),
+        "glb" | "gltf" => {
+            let mut node = unroll(&args.file)?;
+            if args.skeletize {
+                node.skeletize();
+            }
+
+            if args.roundtrip {
+                // Save right back to glTF.
+                roll_gltf(&args.file, &node)
+            } else {
+                // Save to IDM.
+                let idm_file = args.file.with_extension("idm");
+                safe_save(&idm_file, idm::to_string(&node)?.as_bytes())?;
+                eprintln!("Unrolled to {}", idm_file.to_string_lossy());
+                Ok(())
+            }
+        }
+        "idm" => {
+            let mut node = load_idm(&args.file)?;
+            if args.skeletize {
+                node.skeletize();
+            }
+            if args.roundtrip {
+                panic!("Roundtrip is only supported when starting from glTF");
+            }
+            roll_gltf(&args.file, &node)
+        }
         _ => bail!("Unknown file type"),
     }
 }
 
-/// Unroll a glTF file.
-fn unroll(file: impl AsRef<Path>) -> Result<()> {
+fn unroll(file: impl AsRef<Path>) -> Result<Node> {
     let file = file.as_ref();
-
-    let idm_file = file.with_extension("idm");
 
     // Initial glTF loading.
-
     let ctx = Unroller::new(file)?;
-    let root = Node::new(&ctx, &ctx.root_node()?)?;
-
-    // Serialize to IDM and write to disk.
-    safe_save(&idm_file, idm::to_string(&root)?.as_bytes())?;
-    eprintln!("Unrolled to {}", idm_file.to_string_lossy());
-
-    Ok(())
+    Node::new(&ctx, &ctx.root_node()?)
 }
 
-/// Roll our format back to glTF.
-fn roll(file: impl AsRef<Path>) -> Result<()> {
-    let file = file.as_ref();
+fn load_idm(path: impl AsRef<Path>) -> Result<Node> {
+    Ok(idm::from_str(&std::fs::read_to_string(path)?)?)
+}
 
-    // Read file and deserialize to Node with IDM.
-    let input: Node = idm::from_str(&std::fs::read_to_string(file)?)?;
+fn roll_gltf(path: impl AsRef<Path>, root: &Node) -> Result<()> {
+    let path = path.as_ref();
 
-    // Change extension to .gltf and .bin.
-    let gltf_file = file.with_extension("gltf");
-    let bin_file = file.with_extension("bin");
+    // Nodes don't contain their names and the root name isn't contained
+    // anywhere inside the file. Instead, it's the name of the whole file.
+    let root_name = path.file_stem().unwrap().to_string_lossy();
+
+    let gltf_file = path.with_extension("gltf");
+    let bin_file = path.with_extension("bin");
 
     // Our stuff is all in the tree of nodes, so we walk that and write glTF-y
     // stuff out.
 
-    // Nodes don't contain their names and the root name isn't contained
-    // anywhere inside the file. Instead, it's the name of the whole file.
-    let root_name = file.file_stem().unwrap().to_string_lossy();
-
     // Push node tree into the roller.
-    let mut roller = Roller::new(root_name.to_string(), &input);
-    for (name, node, parent) in NodeIter::new(root_name, &input) {
+    let mut roller = Roller::new(root_name.to_string(), root);
+    for (name, node, parent) in NodeIter::new(root_name, root) {
         roller.push_node(&name, node, parent);
     }
 

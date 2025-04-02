@@ -99,6 +99,102 @@ impl Node {
             children,
         ))
     }
+
+    /// Turn the scene graph of this node into a skeletal animation.
+    pub fn skeletize(&mut self) {
+        if self.1.contains_key("armature") {
+            panic!("skeletize: Armature already exists");
+        }
+
+        // Primitives from child nodes that are transformed to world space and
+        // added to the skinned root node.
+        let mut new_primitives = Vec::new();
+
+        // Turn all child nodes with meshes into children of the armature. The
+        // armature itself serves as the joint of the root mesh.
+
+        let mut armature_data = self.0 .0.clone();
+
+        // Root mesh might already have some skinned animation.
+        if !armature_data.skin.is_empty() {
+            // Then we won't try to bake a transformation into its
+            assert!(
+                armature_data.animations.is_empty(),
+                "skeletize: Skinned root node must not have its own animations"
+            );
+
+            if !armature_data.get_transform().is_identity() {
+                // TODO: Implement the reverse transformation on the
+                // primitives of a skinned rootwe push to new_primitives.
+                panic!("skeletize: Transform baking not supported for skinned root node");
+                // This is doable, but an extra bit of complexity I'm not
+                // bothering with yet...
+            }
+
+            // Retain original root mesh data as is instead of pushing it
+            // through the remunging pipeline.
+            new_primitives.append(&mut armature_data.mesh);
+            armature_data.mesh = Vec::new();
+            armature_data.skin.clear();
+        }
+
+        let mut armature = Node((armature_data,), BTreeMap::new());
+
+        for key in self.1.keys().cloned().collect::<Vec<_>>() {
+            // XXX: This only looks at the first level of nodes for has mesh
+            // (skeletonize it) / doesn't have mesh (maybe it's already a
+            // joint, keep it as is). Weird models might have more complex
+            // nesting of mesh vs non-mesh modes but I can't bother to figure
+            // out them all here.
+            if self.1[&key].mesh.is_empty() {
+                log::info!("skeletize: Skipping child node {key} with no mesh");
+            }
+
+            // Move mesh-carrying child nodes from root into armature.
+            armature.1.insert(key.clone(), self.1.remove(&key).unwrap());
+        }
+
+        // Build transformation matrices from global space to nodes.
+        let mut transforms = Vec::new();
+
+        for (_, node, parent_idx) in NodeIter::new("armature", &armature) {
+            let mut transform = node.get_transform();
+
+            if let Some(parent_idx) = parent_idx {
+                transform = transforms[parent_idx] * transform;
+            }
+            transforms.push(transform);
+        }
+
+        for (i, (name, node, _)) in NodeIterMut::new("armature", &mut armature).enumerate() {
+            if node.mesh.is_empty() {
+                continue;
+            }
+
+            assert!(
+                node.skin.is_empty(),
+                "skeletize: Trying to process skinned child node"
+            );
+
+            let inverse = transforms[i].inverse();
+
+            self.0 .0.skin.push(name.clone());
+            if self.0 .0.skin.len() > 254 {
+                panic!("skeletize: Too many joints in armature");
+            }
+
+            let joint_idx = (self.0 .0.skin.len() - 1) as u8;
+
+            for mut p in node.mesh.drain(..) {
+                p.transform(&inverse);
+                p.splat_joint(joint_idx);
+                new_primitives.push(p);
+            }
+        }
+
+        self.1.insert("armature".to_string(), armature);
+        self.0 .0.mesh = new_primitives;
+    }
 }
 
 impl std::ops::Deref for Node {
@@ -124,7 +220,7 @@ impl<'a> NodeIter<'a> {
 }
 
 impl<'a> Iterator for NodeIter<'a> {
-    type Item = (String, &'a Node, Option<usize>);
+    type Item = (String, &'a NodeData, Option<usize>);
 
     fn next(&mut self) -> Option<Self::Item> {
         let (name, node, parent) = self.stack.pop()?;
@@ -133,6 +229,39 @@ impl<'a> Iterator for NodeIter<'a> {
                 .iter()
                 .map(|(name, c)| (name.clone(), c, Some(self.current_idx))),
         );
+        self.current_idx += 1;
+        Some((name, &node.0 .0, parent))
+    }
+}
+
+pub struct NodeIterMut<'a> {
+    stack: Vec<(String, *mut Node, Option<usize>)>,
+    current_idx: usize,
+    phantom: std::marker::PhantomData<&'a mut Node>,
+}
+
+impl<'a> NodeIterMut<'a> {
+    pub fn new(root_name: impl Into<String>, root: &'a mut Node) -> Self {
+        Self {
+            stack: vec![(root_name.into(), root, None)],
+            current_idx: 0,
+            phantom: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<'a> Iterator for NodeIterMut<'a> {
+    type Item = (String, &'a mut NodeData, Option<usize>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let (name, node, parent) = self.stack.pop()?;
+
+        let node = unsafe {
+            for (name, c) in (*node).1.iter_mut() {
+                self.stack.push((name.clone(), c, Some(self.current_idx)));
+            }
+            &mut (*node).0 .0
+        };
         self.current_idx += 1;
         Some((name, node, parent))
     }
@@ -304,6 +433,28 @@ impl Primitive {
             weights,
             material,
         })
+    }
+
+    /// Apply transformation to the spatial geometry of the primitive.
+    fn transform(&mut self, transform: &Mat4) {
+        for p in self.positions.iter_mut() {
+            *p = transform.transform_point3(*p);
+        }
+        for n in self.normals.iter_mut() {
+            *n = transform.transform_vector3(*n);
+            *n = n.normalize();
+        }
+    }
+
+    /// Bind the entire primitive fully to the single joint.
+    fn splat_joint(&mut self, joint: u8) {
+        self.joints = (0..self.positions.len())
+            .map(|_| [joint, 0, 0, 0])
+            .collect();
+
+        self.weights = (0..self.positions.len())
+            .map(|_| Vec4::new(1.0, 0.0, 0.0, 0.0))
+            .collect();
     }
 }
 
