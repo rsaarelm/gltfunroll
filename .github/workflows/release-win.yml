@@ -1,0 +1,35 @@
+name: Windows Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*" # Trigger on version tags like v1.0.0
+
+jobs:
+  build:
+    runs-on: windows-latest # Use the latest Windows runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+
+      - name: Build the project
+        run: |
+          cargo build --release
+
+      - name: Authenticate GitHub CLI
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh auth setup-git
+
+      - name: Create Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cp target/release/gltfunroll.exe .
+          gh release create ${{ github.ref_name }} gltfunroll.exe --title "Release ${{ github.ref_name }}"
