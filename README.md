@@ -46,3 +46,7 @@ You can pipe bits of the IDM file through the `quat2euler` Rust-script included 
 
 If you're annoyed by the model data having noisy rounding error numbers like 0.999999998 or 0.44999999, you can pipe the IDM file through the `numclean` Rust-script to round these to the closest decimal.
 It *probably* won't munge the data.
+
+If you don't have `rust-script` already installed, you can download it from <https://rust-script.org/>.
+You can run the scripts by doing `rust-script quat2euler` and `rust-script numclean`.
+They expect the input to be piped from stdin and print the output to stdout, so you need to use them as part of a shell pipeline or a text editor command to pipe part of a file through a script.
