@@ -17,13 +17,50 @@ use serde::{Deserialize, Serialize};
 pub struct Node(pub (NodeData,), pub BTreeMap<String, Node>);
 
 impl Node {
-    pub(crate) fn new(ctx: &Unroller, source: &gltf::Node) -> Result<Self> {
+    pub(crate) fn new(ctx: &Unroller, source: Option<&gltf::Node>) -> Result<Self> {
+        let mut children = BTreeMap::new();
+
+        // Add this variable here so we can have a root node reference later
+        // on.
+        let roots: Vec<gltf::Node>;
+
+        let source = match source {
+            Some(node) => node,
+            None => {
+                // At the root, if we have a single root node, that becomes
+                // our starting node. If we have several, we create an empty
+                // node at root and put them as children.
+
+                roots = ctx.root_nodes();
+                if roots.is_empty() {
+                    bail!("Node: No root nodes found");
+                } else if roots.len() == 1 {
+                    // Single root node, the default case.
+                    &roots[0]
+                } else {
+                    // Multiple root nodes, we need to wiggle things up for
+                    // our format.
+
+                    // XXX: For unknown reasons, doing the sensible thing here
+                    // and generating an empty root node causes things to crap
+                    // out when the scene is skeletized and loaded into
+                    // Raylib. So instead we do things in a messier way and
+                    // add the side nodes as additional children of the first
+                    // node.
+                    for sibling in roots.iter().skip(1) {
+                        let name = ctx.node_names[sibling.index()].clone();
+                        children.insert(name, Self::new(ctx, Some(sibling))?);
+                    }
+                    &roots[0]
+                }
+            }
+        };
+
         // TODO: Support node cameras. Not high priority for model
         // work.
-        let mut children = BTreeMap::new();
         for child in source.children() {
             let name = ctx.node_names[child.index()].clone();
-            children.insert(name, Self::new(ctx, &child)?);
+            children.insert(name, Self::new(ctx, Some(&child))?);
         }
 
         let skin = if let Some(skin) = source.skin() {
@@ -603,20 +640,16 @@ impl Unroller {
         })
     }
 
-    pub fn root_node(&self) -> Result<gltf::Node> {
+    pub fn root_nodes(&self) -> Vec<gltf::Node> {
         let children: HashSet<usize> = self
             .gltf
             .nodes()
             .flat_map(|n| n.children().map(|n| n.index()))
             .collect();
-        let mut root_nodes = self.gltf.nodes().filter(|n| !children.contains(&n.index()));
-        let Some(root_node) = root_nodes.next() else {
-            bail!("No root node found")
-        };
-        if root_nodes.next().is_some() {
-            bail!("Multiple root nodes found");
-        }
-        Ok(root_node)
+        self.gltf
+            .nodes()
+            .filter(|n| !children.contains(&n.index()))
+            .collect()
     }
 }
 

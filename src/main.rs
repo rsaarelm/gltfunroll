@@ -74,7 +74,7 @@ fn unroll(file: impl AsRef<Path>) -> Result<Node> {
 
     // Initial glTF loading.
     let ctx = Unroller::new(file)?;
-    Node::new(&ctx, &ctx.root_node()?)
+    Node::new(&ctx, None)
 }
 
 fn load_idm(path: impl AsRef<Path>) -> Result<Node> {
