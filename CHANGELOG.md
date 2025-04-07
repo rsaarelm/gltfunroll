@@ -6,8 +6,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## [0.1.1] - 2025-04-07
+
 ### Added
-- Support multiple root nodes, an empty root will be synthesized for them.
+- Process glTF files with multiple root nodes.
+
+### Fixed
+- Skeletize is hopefully actually working now.
 
 ## [0.1.0] - 2025-04-04
 Initial release
