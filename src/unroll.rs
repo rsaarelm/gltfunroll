@@ -143,6 +143,11 @@ impl Node {
             panic!("skeletize: Armature already exists");
         }
 
+        // Clear root's animation and transformation
+        self.0 .0.transform = None;
+        self.0 .0.transform_matrix = None;
+        self.0 .0.animations.clear();
+
         // Primitives from child nodes that are transformed to world space and
         // added to the skinned root node.
         let mut new_primitives = Vec::new();
@@ -176,6 +181,8 @@ impl Node {
         }
 
         let mut armature = Node((armature_data,), BTreeMap::new());
+
+        let animations = self.get_animation_names();
 
         for key in self.1.keys().cloned().collect::<Vec<_>>() {
             // XXX: This only looks at the first level of nodes for has mesh
@@ -213,8 +220,6 @@ impl Node {
                 "skeletize: Trying to process skinned child node"
             );
 
-            let inverse = transforms[i].inverse();
-
             self.0 .0.skin.push(name.clone());
             if self.0 .0.skin.len() > 254 {
                 panic!("skeletize: Too many joints in armature");
@@ -223,14 +228,31 @@ impl Node {
             let joint_idx = (self.0 .0.skin.len() - 1) as u8;
 
             for mut p in node.mesh.drain(..) {
-                p.transform(&inverse);
+                p.transform(&transforms[i]);
                 p.splat_joint(joint_idx);
                 new_primitives.push(p);
+            }
+
+            // We need to add neutral animations to unanimated child nodes so
+            // that Raylib will show them transformed.
+            if !node.get_transform().is_identity() {
+                node.add_neutral_animations(&animations);
             }
         }
 
         self.1.insert("armature".to_string(), armature);
         self.0 .0.mesh = new_primitives;
+    }
+
+    /// Get names and lenghts of all animations in this node tree.
+    fn get_animation_names(&self) -> BTreeMap<String, f32> {
+        let mut ret = BTreeMap::new();
+        for (_, node, _) in NodeIter::new("", self) {
+            for (name, anim) in &node.animations {
+                ret.insert(name.clone(), anim.duration());
+            }
+        }
+        ret
     }
 }
 
@@ -325,13 +347,29 @@ pub struct NodeData {
 impl NodeData {
     pub fn get_transform(&self) -> Mat4 {
         assert!(
-            !self.transform.is_some() || !self.transform_matrix.is_some(),
+            self.transform.is_none() || self.transform_matrix.is_none(),
             "NodeData: Two transforms specified"
         );
         if let Some(transform) = self.transform.as_ref() {
             Mat4::from(*transform)
         } else {
             self.transform_matrix.unwrap_or_default()
+        }
+    }
+
+    /// Add dummy animations that apply translation, needed by skeletize.
+    pub fn add_neutral_animations(&mut self, animations: &BTreeMap<String, f32>) {
+        let translation = self
+            .transform
+            .as_ref()
+            .map(|t| t.translation)
+            .unwrap_or_default();
+        for (name, duration) in animations {
+            if self.animations.contains_key(name) {
+                continue;
+            }
+            self.animations
+                .insert(name.clone(), Animation::neutral(*duration, translation));
         }
     }
 }
@@ -551,6 +589,15 @@ impl Animation {
             && self.weight.is_empty()
     }
 
+    pub fn neutral(duration: f32, translation: Vec3) -> Self {
+        Self {
+            translation: vec![(0.0, translation), (duration, translation)],
+            rotation: vec![(0.0, Angle::default()), (duration, Angle::default())],
+            scale: vec![(0.0, Vec3::ONE), (duration, Vec3::ONE)],
+            weight: vec![(0.0, 1.0), (duration, 1.0)],
+        }
+    }
+
     pub(crate) fn add_channel(
         &mut self,
         ctx: &Unroller,
@@ -596,6 +643,23 @@ impl Animation {
         }
 
         Ok(())
+    }
+
+    pub fn duration(&self) -> f32 {
+        let mut max_time = 0.0f32;
+        if let Some((t, _)) = self.translation.last() {
+            max_time = max_time.max(*t);
+        }
+        if let Some((t, _)) = self.rotation.last() {
+            max_time = max_time.max(*t);
+        }
+        if let Some((t, _)) = self.scale.last() {
+            max_time = max_time.max(*t);
+        }
+        if let Some((t, _)) = self.weight.last() {
+            max_time = max_time.max(*t);
+        }
+        max_time
     }
 }
 
