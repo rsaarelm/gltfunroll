@@ -17,19 +17,25 @@ pub(crate) const VERSION: Option<&str> = option_env!("CARGO_PKG_VERSION");
 /// editable format.
 #[derive(Debug, Parser)]
 struct Args {
-    /// File to transform. If .glb or .gltf, unroll to IDM. If .idm, roll to
-    /// .gltf.
-    pub file: PathBuf,
+    /// Input file to transform. If it's .glb or .gltf, it's read as a glTF
+    /// file, if it's .idm, it's read as an IDM file.
+    pub input: PathBuf,
 
-    /// Do a roundtrip transformation back to the original format. You usually
-    /// want this from glTF to glTF, possibly with extra options.
-    #[clap(long)]
-    pub roundtrip: bool,
+    /// Output file, extension must be .gltf or .idm.
+    pub output: PathBuf,
 
     /// Fuse a scene graph with multiple transformed and animated mesh nodes
     /// into a single root mesh with skeletal animation.
     #[clap(long)]
     pub skeletize: bool,
+
+    /// Rename the first animation for every node into the given name.
+    ///
+    /// Blender often produces files with different animation names for every
+    /// sub-object, while the combined mesh should have a single animation
+    /// name.
+    #[clap(long, name = "NAME")]
+    pub rename_animations: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -37,48 +43,34 @@ fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    match args.file.extension().unwrap().to_str().unwrap() {
-        "glb" | "gltf" => {
-            let mut node = unroll(&args.file)?;
-            if args.skeletize {
-                node.skeletize();
-            }
+    // Read input into IDM file.
+    let mut root = match args.input.extension().unwrap().to_str().unwrap() {
+        // If it's glTF, unroll it first.
+        "glb" | "gltf" => Node::new(&Unroller::new(&args.input)?, None)?,
+        "idm" => idm::from_str(&std::fs::read_to_string(&args.input)?)?,
+        _ => bail!("Unknown input file type"),
+    };
 
-            if args.roundtrip {
-                // Save right back to glTF.
-                roll_gltf(&args.file, &node)
-            } else {
-                // Save to IDM.
-                let idm_file = args.file.with_extension("idm");
-                safe_save(&idm_file, idm::to_string(&node)?.as_bytes())?;
-                eprintln!("Unrolled to {}", idm_file.to_string_lossy());
-                Ok(())
-            }
-        }
-        "idm" => {
-            let mut node = load_idm(&args.file)?;
-            if args.skeletize {
-                node.skeletize();
-            }
-            if args.roundtrip {
-                panic!("Roundtrip is only supported when starting from glTF");
-            }
-            roll_gltf(&args.file, &node)
-        }
-        _ => bail!("Unknown file type"),
+    if let Some(name) = args.rename_animations {
+        root.rename_first_animations(&name);
     }
-}
 
-fn unroll(file: impl AsRef<Path>) -> Result<Node> {
-    let file = file.as_ref();
+    // Turn a scene graph into a single mesh with skeletal animation.
+    if args.skeletize {
+        root.skeletize();
+    }
 
-    // Initial glTF loading.
-    let ctx = Unroller::new(file)?;
-    Node::new(&ctx, None)
-}
-
-fn load_idm(path: impl AsRef<Path>) -> Result<Node> {
-    Ok(idm::from_str(&std::fs::read_to_string(path)?)?)
+    // Write output.
+    match args.output.extension().unwrap().to_str().unwrap() {
+        "gltf" => roll_gltf(&args.output, &root),
+        "idm" => {
+            let idm = idm::to_string(&root)?;
+            std::fs::write(&args.output, idm.as_bytes())?;
+            eprintln!("Unrolled to {}", args.output.to_string_lossy());
+            Ok(())
+        }
+        _ => bail!("Unknown output file type"),
+    }
 }
 
 fn roll_gltf(path: impl AsRef<Path>, root: &Node) -> Result<()> {
@@ -101,86 +93,16 @@ fn roll_gltf(path: impl AsRef<Path>, root: &Node) -> Result<()> {
     }
 
     // Write to disk.
-    safe_save(bin_file, &roller.buffer)?;
+    std::fs::write(bin_file, &roller.buffer)?;
 
     let mut json = serde_json::to_string_pretty(&json::Root::from(roller))?;
     if !json.ends_with('\n') {
         json.push('\n');
     }
 
-    safe_save(&gltf_file, json.as_bytes())?;
+    std::fs::write(&gltf_file, json.as_bytes())?;
 
     eprintln!("Rolled to {}", gltf_file.to_string_lossy());
 
-    Ok(())
-}
-
-fn safe_save(file: impl AsRef<Path>, data: impl AsRef<[u8]>) -> Result<()> {
-    let file = file.as_ref();
-    // If file already exists and is identical to data, do nothing.
-    if file.exists() && std::fs::read(file)? == data.as_ref() {
-        log::info!(
-            "save: {} already exists and is equal to new contents, doing nothing",
-            file.to_string_lossy()
-        );
-        return Ok(());
-    }
-
-    // Otherwise make a smart backup of the original.
-    backup(file)?;
-
-    std::fs::write(file, data)?;
-    Ok(())
-}
-
-/// Smart backup that makes consecutive backups of a file, but reuses the last
-/// backup as long as the file does not change.
-fn backup(file: impl AsRef<Path>) -> Result<()> {
-    let file = file.as_ref();
-    let file_name = file.to_string_lossy();
-
-    if !file.exists() {
-        log::info!("backup: No existing {file_name}, no need to do backups");
-        return Ok(());
-    }
-
-    // Find the highest backup number.
-    let mut highest = 0;
-    let backup_prefix = format!("{file_name}.");
-    for entry in std::fs::read_dir(file.parent().unwrap())? {
-        let path = entry?.path();
-        if !path.is_file() {
-            continue;
-        }
-
-        let path_name = path.to_string_lossy();
-
-        // Look for existing backup files. For our {file_name}, they are
-        // {file_name}.1, {file_name}.2, and so on.
-        if let Some(ext) = path_name.strip_prefix(&backup_prefix) {
-            if let Ok(n) = ext.parse::<u32>() {
-                log::info!("backup: Found backup file {path_name}");
-                if n > highest {
-                    highest = n;
-                }
-            }
-        }
-    }
-
-    log::info!("backup: Last backup found is {file_name}.{highest}");
-
-    let last_backup = PathBuf::from(format!("{}.{}", file.to_string_lossy(), highest));
-
-    if last_backup.exists() && std::fs::read(file)? == std::fs::read(&last_backup)? {
-        log::info!(
-            "backup: {file_name} is already backed up in {}, doing nothing",
-            last_backup.to_string_lossy()
-        );
-        return Ok(());
-    }
-
-    let backup_path = PathBuf::from(format!("{file_name}.{}", highest + 1));
-    log::info!("backup: Saving backup to {}", backup_path.to_string_lossy());
-    std::fs::copy(file, &backup_path)?;
     Ok(())
 }

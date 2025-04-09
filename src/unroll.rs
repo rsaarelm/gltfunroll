@@ -254,6 +254,22 @@ impl Node {
         }
         ret
     }
+
+    pub(crate) fn rename_first_animations(&mut self, name: &str) {
+        for (_, node, _) in NodeIterMut::new("", self) {
+            // XXX: If there are multiple animations, this will always select
+            // the alphabetically first one. You should generally only do
+            // animation-renaming with models with a single animation.
+            let Some(first_name) = node.animations.keys().next().map(|n| n.clone()) else {
+                continue;
+            };
+            let first_anim = node
+                .animations
+                .remove(&first_name)
+                .expect("Animation rename failed");
+            node.animations.insert(name.to_string(), first_anim);
+        }
+    }
 }
 
 impl std::ops::Deref for Node {

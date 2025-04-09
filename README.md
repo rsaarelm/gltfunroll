@@ -7,20 +7,25 @@ You can edit the IDM, then convert it back to glTF.
 
 ## Basic usage
 
-    gltfunroll model.gltf  # Unrolls model.gltf and .bin into model.idm
-    gltfunroll model.idm   # Rolls model.idm into model.gltf and .bin
+    gltfunroll model.gltf model.idm  # Unrolls model.gltf and .bin into model.idm
+    gltfunroll model.idm model.gltf  # Rolls model.idm into model.gltf and .bin
 
 You might be working with an engine that supports only skeletal animation, not scene graph based animations.
 It can be easier to model animated objects as a collection of rigid scene graph nodes, so `gltfunroll` provides an option to convert an animated scene graph into a single node with skeletal animation.
-You can either unroll an IDM, them skeletize when converting back to glTF, or skeletize a glTF model in-place:
+You can specify skeletization to any conversion between IDM and glTF.
+Since this changes the model, you might want to just run an in-place roundtrip conversion:
 
-    gltfunroll --skeletize scene.idm  # Convert to skeletal animation, save scene.gltf.
-    gltfunroll --skeletize --in-place scene.gltf  # Ditto
+    gltfunroll scene.gltf --skeletize scene.gltf  # Skeletize in-place
+
+Modeling programs like Blender like to assign different names to animations on differet objects.
+The unified skeletal animation needs to have all the parts of the same animation bound with the same name.
+For scenes with a single animation, gltfunroll provides `--rename-animations` option that sets the name of every first animation to the same.
+If your scene has multiple animations, you need to either make sure the names are consistent in your modeling program or manually edit your unrolled IDM file and then roll it to glTF.
+A command to convert `scene.gltf` to skeletal animation, with all first animations renamed to `idle`, saved back to the same file:
+
+    gltfunroll scene.gltf --rename-animations=idle --skeletize scene.gltf
 
 ## Implementation details
-
-The tool backs up files it will overwrite with running numbers, `model.gltf.1`, `model.gltf.2` (if `.1` already exists and is different from `.2`), and so on.
-If it's about to write contents exactly identical to the original file, it will not make a backup or touch the file.
 
 The spec of the IDM format is that it's the IDM serialization of a single `struct Node` value that represents the top-level glTF node of a single implicit single-node scene.
 The name of the root node is the same as the filename of the glTF file without extension.
