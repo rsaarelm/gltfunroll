@@ -39,6 +39,10 @@ The tool isn't attempting to cover all of glTF, a primary purpose is to keep the
 If you're dealing with photorealistic industry-grade models, you're probably going to have a bad time trying to do things by hand-editing plaintext files in any case.
 The practical purpose is working with video game models that must be usable with the [raylib](https://www.raylib.com/) engine.
 
+Another major feature of glTF is that it can reuse child nodes in a tree when building complex scenes.
+`gltfunroll` on the other hand deals with strictly tree-shaped structures where all branches are written out.
+There is no attempt to support extensive child node reuse, `gltfunroll` is meant for working with standalone single models, not complex scenes of multiple repeating models.
+
 ## Utilities for working with IDM models
 
 Angles use a variant type.
