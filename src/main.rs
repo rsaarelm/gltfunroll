@@ -8,8 +8,8 @@ use roll::Roller;
 mod roll;
 mod unroll;
 
-pub use unroll::{Angle, Animation, Camera, Mat4, Material, Node, NodeData, Primitive, Trs};
-use unroll::{NodeIter, Unroller};
+use unroll::NodeIter;
+pub use unroll::{Angle, Animation, Camera, Gltf, Mat4, Material, Node, NodeData, Primitive, Trs};
 
 pub(crate) const VERSION: Option<&str> = option_env!("CARGO_PKG_VERSION");
 
@@ -29,13 +29,13 @@ struct Args {
     #[clap(long)]
     pub skeletize: bool,
 
-    /// Rename the first animation for every node into the given name.
+    /// Merge all animations into a single named animation.
     ///
     /// Blender often produces files with different animation names for every
     /// sub-object, while the combined mesh should have a single animation
     /// name.
     #[clap(long, name = "NAME")]
-    pub rename_animations: Option<String>,
+    pub merge_animations: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -44,27 +44,27 @@ fn main() -> Result<()> {
     let args = Args::parse();
 
     // Read input into IDM file.
-    let mut root = match args.input.extension().unwrap().to_str().unwrap() {
+    let mut gltf = match args.input.extension().unwrap().to_str().unwrap() {
         // If it's glTF, unroll it first.
-        "glb" | "gltf" => Node::new(&Unroller::new(&args.input)?, None)?,
+        "glb" | "gltf" => Gltf::new(&args.input)?,
         "idm" => idm::from_str(&std::fs::read_to_string(&args.input)?)?,
         _ => bail!("Unknown input file type"),
     };
 
-    if let Some(name) = args.rename_animations {
-        root.rename_first_animations(&name);
+    if let Some(name) = args.merge_animations {
+        gltf.merge_animations(&name);
     }
 
     // Turn a scene graph into a single mesh with skeletal animation.
     if args.skeletize {
-        root.skeletize();
+        gltf.skeletize()?;
     }
 
     // Write output.
     match args.output.extension().unwrap().to_str().unwrap() {
-        "gltf" => roll_gltf(&args.output, &root),
+        "gltf" => roll_gltf(&args.output, &gltf),
         "idm" => {
-            let idm = idm::to_string(&root)?;
+            let idm = idm::to_string(&gltf)?;
             std::fs::write(&args.output, idm.as_bytes())?;
             eprintln!("Unrolled to {}", args.output.to_string_lossy());
             Ok(())
@@ -73,12 +73,12 @@ fn main() -> Result<()> {
     }
 }
 
-fn roll_gltf(path: impl AsRef<Path>, root: &Node) -> Result<()> {
+fn roll_gltf(path: impl AsRef<Path>, gltf: &Gltf) -> Result<()> {
     let path = path.as_ref();
 
     // Nodes don't contain their names and the root name isn't contained
     // anywhere inside the file. Instead, it's the name of the whole file.
-    let root_name = path.file_stem().unwrap().to_string_lossy();
+    let filename = path.file_stem().unwrap().to_string_lossy();
 
     let gltf_file = path.with_extension("gltf");
     let bin_file = path.with_extension("bin");
@@ -87,9 +87,17 @@ fn roll_gltf(path: impl AsRef<Path>, root: &Node) -> Result<()> {
     // stuff out.
 
     // Push node tree into the roller.
-    let mut roller = Roller::new(root_name.to_string(), root);
-    for (name, node, parent) in NodeIter::new(root_name, root) {
-        roller.push_node(&name, node, parent);
+    let mut roller = Roller::new(filename, gltf);
+    for (root_name, root) in &gltf.nodes {
+        for (name, node, parent) in NodeIter::new(root_name, root) {
+            roller.push_node(&name, node, parent);
+        }
+    }
+
+    for (anim_name, a) in &gltf.animations {
+        for (node_name, anim) in a {
+            roller.push_anim(anim_name, node_name, anim);
+        }
     }
 
     // Write to disk.

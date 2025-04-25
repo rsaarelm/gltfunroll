@@ -11,13 +11,13 @@ use gltf_json::{
     validation::{Checked, USize64},
 };
 
-use crate::{unroll::NodeIter, Animation, Mat4, Material, Node, NodeData, Primitive, VERSION};
+use crate::{unroll::NodeIter, Animation, Gltf, Mat4, Material, NodeData, Primitive, VERSION};
 
 /// Context object for rebuilding a glTF file from a `Node` tree.
 #[derive(Clone, Debug)]
 pub(crate) struct Roller {
-    /// Name of the file and the first node.
-    pub root_name: String,
+    /// Name of the file.
+    pub filename: String,
 
     /// Cumulative transformation matrices from scene graph.
     pub node_transforms: HashMap<String, Mat4>,
@@ -51,7 +51,7 @@ impl From<Roller> for json::Root {
             buffer_views: ctx.buffer_views.clone(),
             buffers: vec![json::Buffer {
                 byte_length: USize64::from(ctx.buffer.len()),
-                uri: Some(format!("{}.bin", ctx.root_name)),
+                uri: Some(format!("{}.bin", ctx.filename)),
                 name: None,
                 extensions: Default::default(),
                 extras: Default::default(),
@@ -114,28 +114,34 @@ impl From<Roller> for json::Root {
 
 impl Roller {
     /// Build the roller, initialize name lookup for the node tree.
-    pub fn new(root_name: impl Into<String>, root: &Node) -> Self {
-        let root_name = root_name.into();
+    pub fn new(filename: impl Into<String>, gltf: &Gltf) -> Self {
+        let filename = filename.into();
         let mut names = BTreeMap::new();
 
         // List of global transforms by node index.
         let mut matrices = Vec::new();
         let mut node_transforms = HashMap::new();
-        for (i, (name, node, parent_idx)) in NodeIter::new(root_name.clone(), root).enumerate() {
-            names.insert(name.clone(), i);
-            let mut transform = node.get_transform();
-            if let Some(parent_idx) = parent_idx {
-                // Multiply node's local transform by parent's global
-                // transform.
-                transform = matrices[parent_idx] * transform;
-            }
-            matrices.push(transform);
 
-            node_transforms.insert(name, transform);
+        let mut i = 0;
+        for (root_name, root) in &gltf.nodes {
+            for (name, node, parent_idx) in NodeIter::new(root_name.clone(), root) {
+                names.insert(name.clone(), i);
+                let mut transform = node.get_transform();
+                if let Some(parent_idx) = parent_idx {
+                    // Multiply node's local transform by parent's global
+                    // transform.
+                    transform = matrices[parent_idx] * transform;
+                }
+                matrices.push(transform);
+
+                node_transforms.insert(name, transform);
+
+                i += 1;
+            }
         }
 
         Self {
-            root_name,
+            filename,
 
             node_transforms,
             buffers: Default::default(),
@@ -290,12 +296,11 @@ impl Roller {
             output.mesh = Some(json::Index::new(idx as u32));
         }
 
-        // Animations
-        for (name, animation) in &node.animations {
-            self.add_anim_channels(idx, name, animation);
-        }
-
         self.nodes.push(output);
+    }
+
+    pub fn push_anim(&mut self, name: &str, node_name: &str, anim: &Animation) {
+        self.add_anim_channels(self.names[node_name], name, anim);
     }
 
     fn push_mesh(&mut self, mesh: &[Primitive]) -> usize {

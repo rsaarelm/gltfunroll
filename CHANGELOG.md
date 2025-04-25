@@ -6,6 +6,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Changed
+- Restructured IDM format to have separate nodes and animations, easier to add
+  new animations to models.
+
 ## [0.2.0] - 2025-04-09
 
 ### Added

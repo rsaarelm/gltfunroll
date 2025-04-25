@@ -3,10 +3,166 @@ use std::{
     path::Path,
 };
 
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use glam::{Quat, Vec2, Vec3, Vec4};
 use gltf::animation::util::ReadOutputs;
 use serde::{Deserialize, Serialize};
+
+/// Toplevel unwrapped document.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct Gltf {
+    /// Named root nodes.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub nodes: BTreeMap<String, Node>,
+
+    /// Named animations, contents are node names mapped to animation tracks.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub animations: BTreeMap<String, BTreeMap<String, Animation>>,
+}
+
+impl Gltf {
+    pub fn new(gltf_path: impl AsRef<Path>) -> Result<Gltf> {
+        let unroller = Unroller::new(gltf_path)?;
+
+        let nodes = unroller
+            .root_nodes()
+            .into_iter()
+            .map(|n| {
+                let name = unroller.node_names[n.index()].clone();
+                Node::new(&unroller, &n).map(|n| (name, n))
+            })
+            .collect::<Result<_>>()?;
+
+        let mut animations = BTreeMap::default();
+        for a in unroller.gltf.animations() {
+            let name = unroller.anim_names[a.index()].clone();
+            let mut animation: BTreeMap<String, Animation> = BTreeMap::new();
+            for c in a.channels() {
+                let node_name = unroller.node_names[c.target().node().index()].clone();
+                let anim_data = animation
+                    .entry(node_name.clone())
+                    .or_default();
+                anim_data.add_channel(&unroller, &c)?;
+            }
+            animations.insert(name, animation);
+        }
+
+        Ok(Gltf { nodes, animations })
+    }
+
+    /// Turn an animated scene graph into a single mesh with skeletal
+    /// animation.
+    pub fn skeletize(&mut self) -> Result<()> {
+        if self.nodes.contains_key("armature") {
+            bail!("skeletize: Armature already exists");
+        }
+
+        let mut armature = Node((Default::default(),), BTreeMap::new());
+
+        // Collect root nodes into armature to be skeletized.
+        for key in self.nodes.keys().cloned().collect::<Vec<_>>() {
+            // XXX: This only looks at the first level of nodes for has mesh
+            // (skeletonize it) / doesn't have mesh (maybe it's already a
+            // joint, keep it as is). Weird models might have more complex
+            // nesting of mesh vs non-mesh modes but I can't bother to figure
+            // out them all here.
+            if self.nodes[&key].mesh.is_empty() {
+                log::info!("skeletize: Skipping child node {key} with no mesh");
+            }
+
+            // Move mesh-carrying child nodes from root into armature.
+            armature
+                .1
+                .insert(key.clone(), self.nodes.remove(&key).unwrap());
+        }
+
+        // Primitives from child nodes that are transformed to world space and
+        // added to the skinned root node.
+        let mut new_primitives = Vec::new();
+
+        // Build transformation matrices from global space to nodes.
+        let mut transforms = Vec::new();
+
+        for (_, node, parent_idx) in NodeIter::new("armature", &armature) {
+            let mut transform = node.get_transform();
+
+            if let Some(parent_idx) = parent_idx {
+                transform = transforms[parent_idx] * transform;
+            }
+            transforms.push(transform);
+        }
+
+        let mut skinned_mesh = NodeData::default();
+
+        for (i, (name, node, _)) in NodeIterMut::new("armature", &mut armature).enumerate() {
+            if node.mesh.is_empty() {
+                continue;
+            }
+
+            if !node.skin.is_empty() {
+                bail!("skeletize: Trying to process skinned child node");
+            }
+
+            skinned_mesh.skin.push(name.clone());
+            if skinned_mesh.skin.len() > 254 {
+                bail!("skeletize: Too many joints in armature");
+            }
+
+            let joint_idx = (skinned_mesh.skin.len() - 1) as u8;
+
+            for mut p in node.mesh.drain(..) {
+                p.transform(&transforms[i]);
+                p.splat_joint(joint_idx);
+                new_primitives.push(p);
+            }
+
+            // We need to add neutral animations to unanimated child nodes so
+            // that Raylib will show them transformed.
+            if !node.get_transform().is_identity() {
+                self.add_neutral_animations(&name, node);
+            }
+        }
+        skinned_mesh.mesh = new_primitives;
+
+        self.nodes.insert("armature".to_string(), armature);
+        self.nodes.insert("model".to_string(), skinned_mesh.into());
+
+        Ok(())
+    }
+
+    pub(crate) fn merge_animations(&mut self, name: &str) {
+        let mut joint_animation = BTreeMap::default();
+
+        for (_, data) in &self.animations {
+            for (node_name, anim) in data {
+                joint_animation.insert(node_name.clone(), anim.clone());
+            }
+        }
+
+        self.animations = BTreeMap::new();
+        self.animations.insert(name.to_string(), joint_animation);
+    }
+
+    /// Add dummy animation that inserts node transformations when skeletizing
+    /// so that the skeletized model will shape up correctly.
+    fn add_neutral_animations(&mut self, node_name: &String, node: &NodeData) {
+        // XXX: Do we need to add rotations too?
+        let translation = node
+            .transform
+            .as_ref()
+            .map(|t| t.translation)
+            .unwrap_or_default();
+        for (_, data) in self.animations.iter_mut() {
+            // Don't clobber existing animations.
+            if data.contains_key(node_name) {
+                continue;
+            }
+            let duration = data.iter().next().map_or(0.0, |(_, a)| a.duration());
+            data.insert(node_name.clone(), Animation::neutral(duration, translation));
+        }
+    }
+}
 
 // Because the output is IDM, the contents of the node are wrapped in this
 // struct that expresses the tree structure. Actual contents, other than names
@@ -17,50 +173,14 @@ use serde::{Deserialize, Serialize};
 pub struct Node(pub (NodeData,), pub BTreeMap<String, Node>);
 
 impl Node {
-    pub(crate) fn new(ctx: &Unroller, source: Option<&gltf::Node>) -> Result<Self> {
+    pub(crate) fn new(ctx: &Unroller, source: &gltf::Node) -> Result<Self> {
         let mut children = BTreeMap::new();
-
-        // Add this variable here so we can have a root node reference later
-        // on.
-        let roots: Vec<gltf::Node>;
-
-        let source = match source {
-            Some(node) => node,
-            None => {
-                // At the root, if we have a single root node, that becomes
-                // our starting node. If we have several, we create an empty
-                // node at root and put them as children.
-
-                roots = ctx.root_nodes();
-                if roots.is_empty() {
-                    bail!("Node: No root nodes found");
-                } else if roots.len() == 1 {
-                    // Single root node, the default case.
-                    &roots[0]
-                } else {
-                    // Multiple root nodes, we need to wiggle things up for
-                    // our format.
-
-                    // XXX: For unknown reasons, doing the sensible thing here
-                    // and generating an empty root node causes things to crap
-                    // out when the scene is skeletized and loaded into
-                    // Raylib. So instead we do things in a messier way and
-                    // add the side nodes as additional children of the first
-                    // node.
-                    for sibling in roots.iter().skip(1) {
-                        let name = ctx.node_names[sibling.index()].clone();
-                        children.insert(name, Self::new(ctx, Some(sibling))?);
-                    }
-                    &roots[0]
-                }
-            }
-        };
 
         // TODO: Support node cameras. Not high priority for model
         // work.
         for child in source.children() {
             let name = ctx.node_names[child.index()].clone();
-            children.insert(name, Self::new(ctx, Some(&child))?);
+            children.insert(name, Self::new(ctx, &child)?);
         }
 
         let skin = if let Some(skin) = source.skin() {
@@ -68,7 +188,7 @@ impl Node {
                 .map(|n| {
                     n.name()
                         .map(|n| n.to_string())
-                        .ok_or_else(|| anyhow::anyhow!("load_skin: Joint has no name"))
+                        .ok_or_else(|| anyhow!("load_skin: Joint has no name"))
                 })
                 .collect::<Result<Vec<_>>>()?
         } else {
@@ -105,6 +225,7 @@ impl Node {
             Default::default()
         };
 
+        // TODO: Get rid of animations in NodeData, moved to toplevel
         let mut animations = BTreeMap::new();
         for a in ctx.gltf.animations() {
             let name = ctx.anim_names[a.index()].clone();
@@ -130,145 +251,10 @@ impl Node {
                 skin,
                 transform,
                 transform_matrix,
-                animations,
                 camera: Default::default(),
             },),
             children,
         ))
-    }
-
-    /// Turn the scene graph of this node into a skeletal animation.
-    pub fn skeletize(&mut self) {
-        if self.1.contains_key("armature") {
-            panic!("skeletize: Armature already exists");
-        }
-
-        // Clear root's animation and transformation
-        self.0 .0.transform = None;
-        self.0 .0.transform_matrix = None;
-        self.0 .0.animations.clear();
-
-        // Primitives from child nodes that are transformed to world space and
-        // added to the skinned root node.
-        let mut new_primitives = Vec::new();
-
-        // Turn all child nodes with meshes into children of the armature. The
-        // armature itself serves as the joint of the root mesh.
-
-        let mut armature_data = self.0 .0.clone();
-
-        // Root mesh might already have some skinned animation.
-        if !armature_data.skin.is_empty() {
-            // Then we won't try to bake a transformation into its
-            assert!(
-                armature_data.animations.is_empty(),
-                "skeletize: Skinned root node must not have its own animations"
-            );
-
-            if !armature_data.get_transform().is_identity() {
-                // TODO: Implement the reverse transformation on the
-                // primitives of a skinned rootwe push to new_primitives.
-                panic!("skeletize: Transform baking not supported for skinned root node");
-                // This is doable, but an extra bit of complexity I'm not
-                // bothering with yet...
-            }
-
-            // Retain original root mesh data as is instead of pushing it
-            // through the remunging pipeline.
-            new_primitives.append(&mut armature_data.mesh);
-            armature_data.mesh = Vec::new();
-            armature_data.skin.clear();
-        }
-
-        let mut armature = Node((armature_data,), BTreeMap::new());
-
-        let animations = self.get_animation_names();
-
-        for key in self.1.keys().cloned().collect::<Vec<_>>() {
-            // XXX: This only looks at the first level of nodes for has mesh
-            // (skeletonize it) / doesn't have mesh (maybe it's already a
-            // joint, keep it as is). Weird models might have more complex
-            // nesting of mesh vs non-mesh modes but I can't bother to figure
-            // out them all here.
-            if self.1[&key].mesh.is_empty() {
-                log::info!("skeletize: Skipping child node {key} with no mesh");
-            }
-
-            // Move mesh-carrying child nodes from root into armature.
-            armature.1.insert(key.clone(), self.1.remove(&key).unwrap());
-        }
-
-        // Build transformation matrices from global space to nodes.
-        let mut transforms = Vec::new();
-
-        for (_, node, parent_idx) in NodeIter::new("armature", &armature) {
-            let mut transform = node.get_transform();
-
-            if let Some(parent_idx) = parent_idx {
-                transform = transforms[parent_idx] * transform;
-            }
-            transforms.push(transform);
-        }
-
-        for (i, (name, node, _)) in NodeIterMut::new("armature", &mut armature).enumerate() {
-            if node.mesh.is_empty() {
-                continue;
-            }
-
-            assert!(
-                node.skin.is_empty(),
-                "skeletize: Trying to process skinned child node"
-            );
-
-            self.0 .0.skin.push(name.clone());
-            if self.0 .0.skin.len() > 254 {
-                panic!("skeletize: Too many joints in armature");
-            }
-
-            let joint_idx = (self.0 .0.skin.len() - 1) as u8;
-
-            for mut p in node.mesh.drain(..) {
-                p.transform(&transforms[i]);
-                p.splat_joint(joint_idx);
-                new_primitives.push(p);
-            }
-
-            // We need to add neutral animations to unanimated child nodes so
-            // that Raylib will show them transformed.
-            if !node.get_transform().is_identity() {
-                node.add_neutral_animations(&animations);
-            }
-        }
-
-        self.1.insert("armature".to_string(), armature);
-        self.0 .0.mesh = new_primitives;
-    }
-
-    /// Get names and lenghts of all animations in this node tree.
-    fn get_animation_names(&self) -> BTreeMap<String, f32> {
-        let mut ret = BTreeMap::new();
-        for (_, node, _) in NodeIter::new("", self) {
-            for (name, anim) in &node.animations {
-                ret.insert(name.clone(), anim.duration());
-            }
-        }
-        ret
-    }
-
-    pub(crate) fn rename_first_animations(&mut self, name: &str) {
-        for (_, node, _) in NodeIterMut::new("", self) {
-            // XXX: If there are multiple animations, this will always select
-            // the alphabetically first one. You should generally only do
-            // animation-renaming with models with a single animation.
-            let Some(first_name) = node.animations.keys().next().map(|n| n.clone()) else {
-                continue;
-            };
-            let first_anim = node
-                .animations
-                .remove(&first_name)
-                .expect("Animation rename failed");
-            node.animations.insert(name.to_string(), first_anim);
-        }
     }
 }
 
@@ -277,6 +263,12 @@ impl std::ops::Deref for Node {
 
     fn deref(&self) -> &Self::Target {
         &self.0 .0
+    }
+}
+
+impl From<NodeData> for Node {
+    fn from(data: NodeData) -> Self {
+        Node((data,), Default::default())
     }
 }
 
@@ -356,8 +348,6 @@ pub struct NodeData {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub mesh: Vec<Primitive>,
     // Animation implicitly attached to one node.
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    pub animations: BTreeMap<String, Animation>,
 }
 
 impl NodeData {
@@ -370,22 +360,6 @@ impl NodeData {
             Mat4::from(*transform)
         } else {
             self.transform_matrix.unwrap_or_default()
-        }
-    }
-
-    /// Add dummy animations that apply translation, needed by skeletize.
-    pub fn add_neutral_animations(&mut self, animations: &BTreeMap<String, f32>) {
-        let translation = self
-            .transform
-            .as_ref()
-            .map(|t| t.translation)
-            .unwrap_or_default();
-        for (name, duration) in animations {
-            if self.animations.contains_key(name) {
-                continue;
-            }
-            self.animations
-                .insert(name.clone(), Animation::neutral(*duration, translation));
         }
     }
 }
@@ -693,24 +667,12 @@ impl Unroller {
     pub fn new(path: impl AsRef<Path>) -> Result<Unroller> {
         let (gltf, buffers, _images) = gltf::import(path)?;
 
-        // Anyone who puts actual names in their data that end with '-gensym'
-        // deserves what they get.
-        let anim_names = gltf
-            .animations()
-            .enumerate()
-            .map(|(i, a)| {
-                a.name()
-                    .map_or_else(|| format!("anim-{}-gensym", i), |n| n.to_string())
-            })
-            .collect();
-        let node_names = gltf
-            .nodes()
-            .enumerate()
-            .map(|(i, a)| {
-                a.name()
-                    .map_or_else(|| format!("node-{}-gensym", i), |n| n.to_string())
-            })
-            .collect();
+        // Generate unique nonempty names for all nodes and animations.
+        let mut nodes = NameGenerator::default();
+        let node_names = gltf.nodes().map(|a| nodes.name(a.name())).collect();
+
+        let mut anims = NameGenerator::default();
+        let anim_names = gltf.animations().map(|a| anims.name(a.name())).collect();
 
         Ok(Unroller {
             gltf,
@@ -832,6 +794,43 @@ impl From<Angle> for Quat {
                 x.to_radians(),
                 z.to_radians(),
             ),
+        }
+    }
+}
+
+#[derive(Default)]
+struct NameGenerator {
+    seen_names: HashSet<String>,
+}
+
+impl NameGenerator {
+    pub fn name(&mut self, name: Option<impl Into<String>>) -> String {
+        // Replace empty names with "gensym".
+        let name = match name {
+            None => "gensym".to_string(),
+            Some(name) => {
+                let name = name.into();
+                if name.trim().is_empty() {
+                    "gensym".to_string()
+                } else {
+                    name
+                }
+            }
+        };
+
+        // Add a running number to repeat names.
+        if self.seen_names.contains(&name) {
+            let mut new_name = name.clone();
+            let mut i = 2;
+            while self.seen_names.contains(&new_name) {
+                new_name = format!("{name}.{i}");
+                i += 1;
+            }
+            self.seen_names.insert(new_name.clone());
+            new_name
+        } else {
+            self.seen_names.insert(name.clone());
+            name
         }
     }
 }
